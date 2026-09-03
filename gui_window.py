@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -15,6 +16,108 @@ from PyQt5.QtWidgets import (
 from pipewire_config import PipeWireConfigManager, STANDARD_RATES, STANDARD_QUANTUMS
 from pipewire_service import PipeWireServiceManager
 
+
+
+# ============================================================
+# 5.1ch アップミックス関連定数 & ヘルパー関数
+# ============================================================
+
+UPMIX_CONF_PATHS = [
+    os.path.expanduser("~/.config/pipewire/pipewire-pulse.conf.d/20-upmix.conf"),
+    os.path.expanduser("~/.config/pipewire/client.conf.d/20-upmix.conf"),
+]
+
+UPMIX_PRESETS = {
+    "標準 (PSD標準)": {
+        "method": "psd",
+        "lfe_cutoff": 150,
+        "rear_delay": 0.0,
+        "fc_cutoff": 12000,
+        "stereo_widen": 0.0,
+    },
+    "映画・サラウンド重視": {
+        "method": "psd",
+        "lfe_cutoff": 120,
+        "rear_delay": 15.0,
+        "fc_cutoff": 10000,
+        "stereo_widen": 0.1,
+    },
+    "音楽・自然な広がり": {
+        "method": "psd",
+        "lfe_cutoff": 80,
+        "rear_delay": 5.0,
+        "fc_cutoff": 0,
+        "stereo_widen": 0.2,
+    },
+    "シンプル (Simple方式)": {
+        "method": "simple",
+        "lfe_cutoff": 120,
+        "rear_delay": 0.0,
+        "fc_cutoff": 0,
+        "stereo_widen": 0.0,
+    },
+}
+UPMIX_CUSTOM_PRESET_NAME = "カスタム (手動設定)"
+
+
+def upmix_is_enabled() -> bool:
+    """両方の設定ファイルが存在するとき True を返す。"""
+    return all(os.path.exists(p) for p in UPMIX_CONF_PATHS)
+
+
+def upmix_parse_config(filepath: str) -> dict:
+    """設定ファイルを読み込んでパラメータ辞書を返す。"""
+    params = {
+        "method": "psd",
+        "lfe_cutoff": 150,
+        "rear_delay": 0.0,
+        "fc_cutoff": 0,
+        "stereo_widen": 0.0,
+    }
+    if not os.path.exists(filepath):
+        return params
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+        m = re.search(r"channelmix\.upmix-method\s*=\s*(\w+)", content)
+        if m:
+            params["method"] = m.group(1)
+        m = re.search(r"channelmix\.lfe-cutoff\s*=\s*(\d+)", content)
+        if m:
+            params["lfe_cutoff"] = int(m.group(1))
+        m = re.search(r"channelmix\.rear-delay\s*=\s*([\d.]+)", content)
+        if m:
+            params["rear_delay"] = float(m.group(1))
+        m = re.search(r"channelmix\.fc-cutoff\s*=\s*(\d+)", content)
+        if m:
+            params["fc_cutoff"] = int(m.group(1))
+        m = re.search(r"channelmix\.stereo-widen\s*=\s*([\d.]+)", content)
+        if m:
+            params["stereo_widen"] = float(m.group(1))
+    except Exception:
+        pass
+    return params
+
+
+def upmix_generate_config(params: dict) -> str:
+    """パラメータ辞書から PipeWire 設定ファイル文字列を生成する。"""
+    lines = [
+        "stream.properties = {",
+        "    channelmix.upmix = true",
+        f"    channelmix.upmix-method = {params.get('method', 'psd')}",
+        f"    channelmix.lfe-cutoff = {int(params.get('lfe_cutoff', 150))}",
+    ]
+    rear_delay = float(params.get("rear_delay", 0.0))
+    if rear_delay > 0:
+        lines.append(f"    channelmix.rear-delay = {rear_delay:.1f}")
+    fc_cutoff = int(params.get("fc_cutoff", 0))
+    if fc_cutoff > 0:
+        lines.append(f"    channelmix.fc-cutoff = {fc_cutoff}")
+    stereo_widen = float(params.get("stereo_widen", 0.0))
+    if stereo_widen > 0:
+        lines.append(f"    channelmix.stereo-widen = {stereo_widen:.2f}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 class PwTopWorker(QThread):
@@ -255,6 +358,7 @@ class GUIPipeWireWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_clock_tab(), "⏱️ クロック・サンプリングレート")
         self.tabs.addTab(self._create_resample_tab(), "🎛️ クライアント・リサンプル")
+        self.tabs.addTab(self._create_upmix_tab(), "🔊 5.1ch アップミックス")
         self.tabs.addTab(self._create_preset_tab(), "⚡ プリセット")
         self.tabs.addTab(self._create_raw_editor_tab(), "📝 設定ファイル直接編集")
         self.tabs.addTab(self._create_status_tab(), "📊 リアルタイム監視 & ログ")
@@ -562,11 +666,28 @@ class GUIPipeWireWindow(QMainWindow):
         self.cmb_editor_file = QComboBox()
         self.cmb_editor_file.addItem("10-clock.conf (~/.config/pipewire/pipewire.conf.d/10-clock.conf)", str(self.config_mgr.clock_conf_file))
         self.cmb_editor_file.addItem("10-resample.conf (~/.config/pipewire/client.conf.d/10-resample.conf)", str(self.config_mgr.resample_conf_file))
+        self.cmb_editor_file.addItem("20-upmix.conf [Pulse] (~/.config/pipewire/pipewire-pulse.conf.d/20-upmix.conf)", UPMIX_CONF_PATHS[0])
+        self.cmb_editor_file.addItem("20-upmix.conf [Client] (~/.config/pipewire/client.conf.d/20-upmix.conf)", UPMIX_CONF_PATHS[1])
+
+        added_paths = {
+            str(self.config_mgr.clock_conf_file),
+            str(self.config_mgr.resample_conf_file),
+            UPMIX_CONF_PATHS[0],
+            UPMIX_CONF_PATHS[1],
+        }
 
         # 既存の他ファイルも検索して追加
-        for f in self.config_mgr.client_conf_d.glob("*.conf"):
-            if f != self.config_mgr.resample_conf_file:
-                self.cmb_editor_file.addItem(f"{f.name} (~/.config/pipewire/client.conf.d/{f.name})", str(f))
+        scan_dirs = [
+            self.config_mgr.pw_conf_d,
+            self.config_mgr.client_conf_d,
+            Path(os.path.expanduser("~/.config/pipewire/pipewire-pulse.conf.d")),
+        ]
+        for d in scan_dirs:
+            if d.exists():
+                for f in d.glob("*.conf"):
+                    if str(f) not in added_paths:
+                        self.cmb_editor_file.addItem(f"{f.name} ({f})", str(f))
+                        added_paths.add(str(f))
 
         self.cmb_editor_file.currentIndexChanged.connect(self._load_raw_file_to_editor)
         hbox_select.addWidget(self.cmb_editor_file)
@@ -608,6 +729,9 @@ class GUIPipeWireWindow(QMainWindow):
                 f.write(self.txt_raw_editor.toPlainText())
             QMessageBox.information(self, "保存完了", f"{os.path.basename(file_path)} を保存しました。")
             self.load_all_settings()
+            if hasattr(self, "_upmix_load_from_file"):
+                self._upmix_load_from_file()
+                self._upmix_refresh_status_badge()
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", f"保存失敗: {e}")
 
@@ -700,6 +824,11 @@ class GUIPipeWireWindow(QMainWindow):
         m_idx = self.cmb_upmix_method.findText(method)
         if m_idx >= 0:
             self.cmb_upmix_method.setCurrentIndex(m_idx)
+
+        # 5.1ch アップミックス設定の読み込み
+        if hasattr(self, "_upmix_load_from_file"):
+            self._upmix_load_from_file()
+            self._upmix_refresh_status_badge()
 
     def update_live_status(self):
         """サービス状態と pw-metadata の定期更新"""
@@ -868,3 +997,312 @@ class GUIPipeWireWindow(QMainWindow):
     def update_pw_top(self):
         """後方互換のため残す（trigger_pw_top_update に委譲）"""
         self.trigger_pw_top_update()
+
+
+    # ============================================================
+    # タブ: 🔊 5.1ch アップミックス
+    # ============================================================
+
+    def _create_upmix_tab(self):
+        """5.1ch アップミックス設定タブを生成して返す。"""
+        self._upmix_updating = False
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(16)
+
+        # --- 状態バッジ ---
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(QLabel("現在の状態:"))
+        self.lbl_upmix_status = QLabel()
+        self.lbl_upmix_status.setObjectName("status_badge")
+        self._upmix_refresh_status_badge()
+        status_layout.addWidget(self.lbl_upmix_status)
+        status_layout.addStretch()
+        layout.addLayout(status_layout)
+
+        # --- プリセット選択 ---
+        group_preset = QGroupBox("プリセット選択")
+        vbox_preset = QVBoxLayout(group_preset)
+        preset_names = list(UPMIX_PRESETS.keys()) + [UPMIX_CUSTOM_PRESET_NAME]
+        self.cmb_upmix_preset = QComboBox()
+        self.cmb_upmix_preset.addItems(preset_names)
+        self.cmb_upmix_preset.currentTextChanged.connect(self._upmix_on_preset_selected)
+        vbox_preset.addWidget(self.cmb_upmix_preset)
+        layout.addWidget(group_preset)
+
+        # --- 詳細パラメータ ---
+        group_params = QGroupBox("詳細パラメータ調整")
+        params_layout = QVBoxLayout(group_params)
+        params_layout.setSpacing(12)
+
+        # アップミックス方式
+        row_method = QHBoxLayout()
+        row_method.addWidget(QLabel("アップミックス方式 (channelmix.upmix-method):"))
+        self.cmb_upmix_method2 = QComboBox()
+        self.cmb_upmix_method2.addItems(["psd", "simple", "none"])
+        self.cmb_upmix_method2.currentTextChanged.connect(self._upmix_on_param_changed)
+        row_method.addWidget(self.cmb_upmix_method2)
+        row_method.addStretch()
+        params_layout.addLayout(row_method)
+
+        # LFE カットオフ
+        params_layout.addWidget(QLabel("サブウーファー LFE カットオフ (channelmix.lfe-cutoff):"))
+        row_lfe = QHBoxLayout()
+        self.slider_upmix_lfe = QSlider(Qt.Horizontal)
+        self.slider_upmix_lfe.setRange(40, 200)
+        self.slider_upmix_lfe.setSingleStep(10)
+        self.slider_upmix_lfe.setPageStep(10)
+        self.slider_upmix_lfe.setValue(150)
+        self.lbl_upmix_lfe = QLabel("150 Hz")
+        self.lbl_upmix_lfe.setMinimumWidth(70)
+        self.slider_upmix_lfe.valueChanged.connect(
+            lambda v: (self.lbl_upmix_lfe.setText(f"{v} Hz"), self._upmix_on_param_changed())
+        )
+        row_lfe.addWidget(self.slider_upmix_lfe)
+        row_lfe.addWidget(self.lbl_upmix_lfe)
+        params_layout.addLayout(row_lfe)
+
+        # リアスピーカーディレイ
+        params_layout.addWidget(QLabel("リアスピーカー ディレイ (channelmix.rear-delay, ms / 0=なし):"))
+        row_delay = QHBoxLayout()
+        self.slider_upmix_delay = QSlider(Qt.Horizontal)
+        self.slider_upmix_delay.setRange(0, 500)   # 0.0～50.0ms を 10倍スケールで管理
+        self.slider_upmix_delay.setSingleStep(5)
+        self.slider_upmix_delay.setPageStep(50)
+        self.slider_upmix_delay.setValue(0)
+        self.lbl_upmix_delay = QLabel("0.0 ms")
+        self.lbl_upmix_delay.setMinimumWidth(70)
+        self.slider_upmix_delay.valueChanged.connect(
+            lambda v: (self.lbl_upmix_delay.setText(f"{v / 10:.1f} ms"), self._upmix_on_param_changed())
+        )
+        row_delay.addWidget(self.slider_upmix_delay)
+        row_delay.addWidget(self.lbl_upmix_delay)
+        params_layout.addLayout(row_delay)
+
+        # センター FC カットオフ
+        params_layout.addWidget(QLabel("センター FC カットオフ (channelmix.fc-cutoff, Hz / 0=無効):"))
+        row_fc = QHBoxLayout()
+        self.slider_upmix_fc = QSlider(Qt.Horizontal)
+        self.slider_upmix_fc.setRange(0, 40)       # 0～20000Hz を 500Hz刻みで管理
+        self.slider_upmix_fc.setSingleStep(1)
+        self.slider_upmix_fc.setPageStep(4)
+        self.slider_upmix_fc.setValue(0)
+        self.lbl_upmix_fc = QLabel("0 Hz (無効)")
+        self.lbl_upmix_fc.setMinimumWidth(110)
+        self.slider_upmix_fc.valueChanged.connect(
+            lambda v: (
+                self.lbl_upmix_fc.setText(f"{v * 500} Hz" if v > 0 else "0 Hz (無効)"),
+                self._upmix_on_param_changed()
+            )
+        )
+        row_fc.addWidget(self.slider_upmix_fc)
+        row_fc.addWidget(self.lbl_upmix_fc)
+        params_layout.addLayout(row_fc)
+
+        # ステレオワイド
+        params_layout.addWidget(QLabel("ステレオ背景の広がり感 (channelmix.stereo-widen, 0.00～1.00):"))
+        row_widen = QHBoxLayout()
+        self.slider_upmix_widen = QSlider(Qt.Horizontal)
+        self.slider_upmix_widen.setRange(0, 20)    # 0.00～1.00 を 0.05刻みで管理
+        self.slider_upmix_widen.setSingleStep(1)
+        self.slider_upmix_widen.setPageStep(2)
+        self.slider_upmix_widen.setValue(0)
+        self.lbl_upmix_widen = QLabel("0.00")
+        self.lbl_upmix_widen.setMinimumWidth(40)
+        self.slider_upmix_widen.valueChanged.connect(
+            lambda v: (self.lbl_upmix_widen.setText(f"{v * 0.05:.2f}"), self._upmix_on_param_changed())
+        )
+        row_widen.addWidget(self.slider_upmix_widen)
+        row_widen.addWidget(self.lbl_upmix_widen)
+        params_layout.addLayout(row_widen)
+
+        layout.addWidget(group_params)
+
+        # --- ボタン群 ---
+        group_actions = QGroupBox("操作")
+        btn_layout = QHBoxLayout(group_actions)
+        btn_layout.setSpacing(10)
+
+        btn_enable = QPushButton("✅ 有効化 (再起動)")
+        btn_enable.setObjectName("btn_primary")
+        btn_enable.clicked.connect(self._upmix_enable)
+        btn_layout.addWidget(btn_enable)
+
+        btn_disable = QPushButton("❌ 無効化 (2ch復帰)")
+        btn_disable.setObjectName("btn_danger")
+        btn_disable.clicked.connect(self._upmix_disable)
+        btn_layout.addWidget(btn_disable)
+
+        btn_test = QPushButton("🔉 スピーカーテスト (6ch)")
+        btn_test.clicked.connect(self._upmix_speaker_test)
+        btn_layout.addWidget(btn_test)
+
+        layout.addWidget(group_actions)
+
+        # 設定ファイルパス案内
+        lbl_paths = QLabel(
+            "※ 設定ファイル: " + UPMIX_CONF_PATHS[0] + " / " + UPMIX_CONF_PATHS[1]
+        )
+        lbl_paths.setStyleSheet("color: #a6adc8; font-style: italic; font-size: 9pt;")
+        layout.addWidget(lbl_paths)
+
+        layout.addStretch()
+
+        # 現在の設定ファイルの値で UI を初期化
+        self._upmix_load_from_file()
+
+        return tab
+
+    def _upmix_get_params(self) -> dict:
+        """UI の現在値をパラメータ辞書として返す。"""
+        return {
+            "method": self.cmb_upmix_method2.currentText(),
+            "lfe_cutoff": self.slider_upmix_lfe.value(),
+            "rear_delay": self.slider_upmix_delay.value() / 10.0,
+            "fc_cutoff": self.slider_upmix_fc.value() * 500,
+            "stereo_widen": round(self.slider_upmix_widen.value() * 0.05, 2),
+        }
+
+    def _upmix_set_params(self, p: dict):
+        """パラメータ辞書を UI に反映する（シグナルを一時的にブロック）。"""
+        self._upmix_updating = True
+        try:
+            idx = self.cmb_upmix_method2.findText(p.get("method", "psd"))
+            if idx >= 0:
+                self.cmb_upmix_method2.setCurrentIndex(idx)
+            self.slider_upmix_lfe.setValue(int(p.get("lfe_cutoff", 150)))
+            self.slider_upmix_delay.setValue(int(round(p.get("rear_delay", 0.0) * 10)))
+            self.slider_upmix_fc.setValue(int(p.get("fc_cutoff", 0)) // 500)
+            self.slider_upmix_widen.setValue(int(round(p.get("stereo_widen", 0.0) / 0.05)))
+        finally:
+            self._upmix_updating = False
+        # ラベルを手動更新
+        self.lbl_upmix_lfe.setText(f"{self.slider_upmix_lfe.value()} Hz")
+        self.lbl_upmix_delay.setText(f"{self.slider_upmix_delay.value() / 10:.1f} ms")
+        fc = self.slider_upmix_fc.value() * 500
+        self.lbl_upmix_fc.setText(f"{fc} Hz" if fc > 0 else "0 Hz (無効)")
+        self.lbl_upmix_widen.setText(f"{self.slider_upmix_widen.value() * 0.05:.2f}")
+
+    def _upmix_load_from_file(self):
+        """既存の設定ファイルを読み込んで UI を初期化する。"""
+        params = upmix_parse_config(UPMIX_CONF_PATHS[0])
+        self._upmix_set_params(params)
+        self._upmix_detect_preset()
+
+    def _upmix_detect_preset(self):
+        """現在のパラメータに合致するプリセットを検索してコンボボックスに反映する。"""
+        current = self._upmix_get_params()
+        for name, preset in UPMIX_PRESETS.items():
+            if all(current[k] == preset[k] for k in preset):
+                self._upmix_updating = True
+                self.cmb_upmix_preset.setCurrentText(name)
+                self._upmix_updating = False
+                return
+        self._upmix_updating = True
+        self.cmb_upmix_preset.setCurrentText(UPMIX_CUSTOM_PRESET_NAME)
+        self._upmix_updating = False
+
+    def _upmix_refresh_status_badge(self):
+        """有効/無効状態バッジを更新する。"""
+        if upmix_is_enabled():
+            self.lbl_upmix_status.setText(" ● 有効 (5.1ch Upmix ON) ")
+            self.lbl_upmix_status.setStyleSheet(
+                "background-color: #a6e3a1; color: #11111b; "
+                "padding: 4px 10px; border-radius: 12px; font-weight: bold;"
+            )
+        else:
+            self.lbl_upmix_status.setText(" ✖ 無効 (標準 2ch Direct) ")
+            self.lbl_upmix_status.setStyleSheet(
+                "background-color: #f38ba8; color: #11111b; "
+                "padding: 4px 10px; border-radius: 12px; font-weight: bold;"
+            )
+
+    # ------ シグナルハンドラ ------
+
+    def _upmix_on_preset_selected(self, preset_name: str):
+        """プリセット選択時: パラメータを一括反映する。"""
+        if self._upmix_updating:
+            return
+        if preset_name in UPMIX_PRESETS:
+            self._upmix_set_params(UPMIX_PRESETS[preset_name])
+
+    def _upmix_on_param_changed(self):
+        """スライダー/コンボ変更時: プリセット表示を更新する。"""
+        if self._upmix_updating:
+            return
+        self._upmix_detect_preset()
+
+    # ------ ボタン操作 ------
+
+    def _upmix_enable(self):
+        """現在の UI パラメータで設定ファイルを書き込み、PipeWire を再起動する。"""
+        params = self._upmix_get_params()
+        conf_content = upmix_generate_config(params)
+        try:
+            for path in UPMIX_CONF_PATHS:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(conf_content)
+            self.service_mgr.restart_pipewire()
+            self._upmix_refresh_status_badge()
+            self.update_live_status()
+            QMessageBox.information(
+                self,
+                "有効化 完了",
+                f"5.1ch アップミックス設定を適用しました。\nPipeWire を再起動しました。\n\n"
+                f"[設定値]\n"
+                f"方式            : {params['method']}\n"
+                f"LFE カットオフ  : {params['lfe_cutoff']} Hz\n"
+                f"リアディレイ    : {params['rear_delay']:.1f} ms\n"
+                f"FC カットオフ   : {params['fc_cutoff']} Hz\n"
+                f"ステレオワイド  : {params['stereo_widen']:.2f}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", str(e))
+
+    def _upmix_disable(self):
+        """設定ファイルを削除し PipeWire を再起動してアップミックスを無効化する。"""
+        removed = []
+        try:
+            for path in UPMIX_CONF_PATHS:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed.append(path)
+            self.service_mgr.restart_pipewire()
+            self._upmix_refresh_status_badge()
+            self.update_live_status()
+            QMessageBox.information(
+                self,
+                "無効化 完了",
+                "5.1ch アップミックスを無効化し、標準 2ch Direct に戻しました。\nPipeWire を再起動しました。",
+            )
+        except Exception as e:
+            # 削除済みファイルをロールバック
+            params = self._upmix_get_params()
+            conf_content = upmix_generate_config(params)
+            for path in removed:
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(conf_content)
+                except OSError:
+                    pass
+            QMessageBox.critical(
+                self, "エラー",
+                f"無効化に失敗しました（変更を元に戻しました）:\n{e}"
+            )
+
+    def _upmix_speaker_test(self):
+        """6ch スピーカーテストを非同期で起動する。"""
+        try:
+            subprocess.Popen(
+                ["speaker-test", "-D", "pulse", "-c", "6", "-t", "wav", "-l", "1"]
+            )
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self,
+                "コマンド未検出",
+                "speaker-test コマンドが見つかりません。\nalsa-utils をインストールしてください。",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"テストの実行に失敗しました: {e}")
