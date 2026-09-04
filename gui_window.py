@@ -10,11 +10,13 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QComboBox, QCheckBox, QSlider, QSpinBox,
     QPushButton, QTextEdit, QGroupBox, QGridLayout, QMessageBox,
-    QSplitter, QStatusBar, QFrame, QScrollArea, QStyleFactory
+    QSplitter, QStatusBar, QFrame, QScrollArea, QStyleFactory, QProgressBar
 )
 
 from pipewire_config import PipeWireConfigManager, STANDARD_RATES, STANDARD_QUANTUMS
 from pipewire_service import PipeWireServiceManager
+from pipewire_agc import PipeWireAGCManager, MicrophoneMonitorThread
+from pipewire_calibrator import CalibrationWorkerThread, apply_51ch_channel_volumes, get_51ch_channel_volumes, CHANNEL_NAMES
 
 
 
@@ -137,6 +139,7 @@ class PwTopWorker(QThread):
             else:
                 self.result_ready.emit(raw.strip() or p.stderr.strip())
         except Exception as e:
+            self._mic_log(f"テスト音再生エラー: {e}")
             self.result_ready.emit(f"pw-top 取得エラー: {e}")
 
 
@@ -149,6 +152,8 @@ class GUIPipeWireWindow(QMainWindow):
         super().__init__()
         self.config_mgr = PipeWireConfigManager()
         self.service_mgr = PipeWireServiceManager()
+        self.agc_mgr = PipeWireAGCManager()
+        self.mic_monitor_thread = None
         self._unsaved_changes = False
 
         self.setWindowTitle(self.BASE_TITLE)
@@ -255,6 +260,22 @@ class GUIPipeWireWindow(QMainWindow):
             QPushButton:pressed {
                 background-color: #585b70;
             }
+            
+            QProgressBar {
+                border: 1px solid #45475a;
+                border-radius: 6px;
+                text-align: center;
+                color: #ffffff;
+                background-color: #11111b;
+                height: 20px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #a6e3a1, stop:0.7 #f9e2af, stop:0.9 #fab387, stop:1.0 #f38ba8);
+                border-radius: 5px;
+            }
             QPushButton#btn_primary {
                 background-color: #89b4fa;
                 color: #11111b;
@@ -329,6 +350,12 @@ class GUIPipeWireWindow(QMainWindow):
             }
         """)
 
+
+    def closeEvent(self, event):
+        if hasattr(self, 'mic_monitor_thread') and self.mic_monitor_thread:
+            self.mic_monitor_thread.stop()
+        event.accept()
+
     def _init_ui(self):
         main_widget = QWidget()
         main_layout = QVBoxLayout(main_widget)
@@ -356,12 +383,13 @@ class GUIPipeWireWindow(QMainWindow):
 
         # タブウィジェット
         self.tabs = QTabWidget()
+        self.tabs.addTab(self._create_preset_tab(), "⚡ プリセット")
+        self.tabs.addTab(self._create_upmix_tab(), "🔊 5.1ch アップミックス")
+        self.tabs.addTab(self._create_mic_agc_tab(), "🎙️ マイク & AGC (自動音量均一化)")
         self.tabs.addTab(self._create_clock_tab(), "⏱️ クロック・サンプリングレート")
         self.tabs.addTab(self._create_resample_tab(), "🎛️ クライアント・リサンプル")
-        self.tabs.addTab(self._create_upmix_tab(), "🔊 5.1ch アップミックス")
-        self.tabs.addTab(self._create_preset_tab(), "⚡ プリセット")
-        self.tabs.addTab(self._create_raw_editor_tab(), "📝 設定ファイル直接編集")
         self.tabs.addTab(self._create_status_tab(), "📊 リアルタイム監視 & ログ")
+        self.tabs.addTab(self._create_raw_editor_tab(), "📝 設定ファイル直接編集")
         main_layout.addWidget(self.tabs)
 
         # 全設定ウィジェットの変更シグナルを _mark_unsaved に接続
@@ -715,7 +743,7 @@ class GUIPipeWireWindow(QMainWindow):
                 with open(file_path, "r", encoding="utf-8") as f:
                     self.txt_raw_editor.setText(f.read())
             except Exception as e:
-                self.txt_raw_editor.setText(f"# ファイル読込エラー: {e}")
+                self.txt_raw_editor.setText(f"# 読み込みエラー: {e}")
         else:
             self.txt_raw_editor.setText("# (このファイルは未作成です。設定保存時に自動生成されます)")
 
@@ -733,7 +761,8 @@ class GUIPipeWireWindow(QMainWindow):
                 self._upmix_load_from_file()
                 self._upmix_refresh_status_badge()
         except Exception as e:
-            QMessageBox.critical(self, "保存エラー", f"保存失敗: {e}")
+            self._mic_log(f"テスト音再生エラー: {e}")
+            QMessageBox.critical(self, "保存エラー", str(e))
 
     # -------------------------------------------------------------
     # タブ5: リアルタイム監視 & ログ
@@ -929,19 +958,58 @@ class GUIPipeWireWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "初期化の確認",
-            "GUIPipeWireで生成したカスタム設定ファイルを削除し、システムのデフォルト設定に戻しますか？\n(PipeWireも再起動されます)",
+            "GUIPipeWireで生成した全ての設定（クロック、リサンプル、5.1chアップミックス、マイクAGC仮想マイク等）を削除し、チャンネル音量もフラットに初期化してシステムのデフォルト状態に復元しますか？\n\n(PipeWireサービスも自動で再起動されます)",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            removed = self.config_mgr.reset_custom_configs()
-            self.service_mgr.restart_pipewire()
-            self.load_all_settings()
-            self.update_live_status()
-            self.update_logs()
-            self._unsaved_changes = False
-            self._update_title()
-            QMessageBox.information(self, "リセット完了", f"以下のカスタム設定ファイルを削除しデフォルトに復元しました:\n" + "\n".join(removed))
+            try:
+                # 1. 全設定ファイルのクリーンアップ
+                removed = self.config_mgr.reset_custom_configs()
+                
+                # 2. マイクAGC仮想マイクの無効化
+                self.agc_mgr.disable_hardware_agc()
+                self.chk_soft_agc_enable.setChecked(False)
+                self.slider_mic_gain.setValue(100)
+                
+                # 3. 5.1chチャンネル音量を100%にリセット
+                try:
+                    apply_51ch_channel_volumes("default", [1.0] * 6)
+                except Exception:
+                    pass
+                
+                # 4. PipeWireサービスの再起動
+                self.service_mgr.restart_pipewire()
+                
+                # 5. UI状態の完全リロード & 同期
+                self.load_all_settings()
+                self.update_live_status()
+                self.update_logs()
+                self._upmix_load_from_file()
+                self._upmix_refresh_status_badge()
+                self._calib_reset_flat()
+                self._mic_refresh_hw_status()
+                self._mic_refresh_sources()
+                
+                self._unsaved_changes = False
+                self._update_title()
+                
+                msg = (
+                    "全ての設定をシステムデフォルトに復元しました！\n\n"
+                    "【初期化された項目】\n"
+                    "・⏱️ クロック & サンプリングレート設定\n"
+                    "・🎛️ クライアント・リサンプル品質設定\n"
+                    "・🔊 5.1ch アップミックス設定 (2ch Directに復元)\n"
+                    "・⚡ マイク WebRTC AGC 仮想マイク (無効化)\n"
+                    "・🎯 5.1ch スピーカー個別音量 (全ch 100%にリセット)\n"
+                    "・🔄 PipeWire サービスの再起動\n"
+                )
+                if removed:
+                    msg += "\n[削除された設定ファイル]\n" + "\n".join(removed)
+                
+                QMessageBox.information(self, "完全リセット完了", msg)
+            except Exception as e:
+                QMessageBox.critical(self, "リセットエラー", f"デフォルトへの初期化中にエラーが発生しました: {e}")
 
 
     # -------------------------------------------------------------
@@ -999,162 +1067,275 @@ class GUIPipeWireWindow(QMainWindow):
         self.trigger_pw_top_update()
 
 
-    # ============================================================
+# ============================================================
+    # タブ: 🔊 5.1ch アップミックス
+# ============================================================
     # タブ: 🔊 5.1ch アップミックス
     # ============================================================
 
     def _create_upmix_tab(self):
-        """5.1ch アップミックス設定タブを生成して返す。"""
+        """5.1ch アップミックス設定 & 自動音響キャリブレーションタブを生成して返す (スクロール不要の2カラム構成)"""
         self._upmix_updating = False
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setSpacing(16)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
 
-        # --- 状態バッジ ---
-        status_layout = QHBoxLayout()
-        status_layout.addWidget(QLabel("現在の状態:"))
+        # ========================================================
+        # 左カラム: 🔊 5.1ch アップミックス空間音響設定
+        # ========================================================
+        col_left = QVBoxLayout()
+        col_left.setSpacing(10)
+
+        group_upmix = QGroupBox("🔊 5.1ch アップミックス設定")
+        vbox_upmix = QVBoxLayout(group_upmix)
+        vbox_upmix.setContentsMargins(12, 14, 12, 12)
+        vbox_upmix.setSpacing(10)
+
+        # 状態バッジ & プリセット行
+        row_top = QHBoxLayout()
+        row_top.setSpacing(8)
+        row_top.addWidget(QLabel("状態:"))
         self.lbl_upmix_status = QLabel()
         self.lbl_upmix_status.setObjectName("status_badge")
         self._upmix_refresh_status_badge()
-        status_layout.addWidget(self.lbl_upmix_status)
-        status_layout.addStretch()
-        layout.addLayout(status_layout)
-
-        # --- プリセット選択 ---
-        group_preset = QGroupBox("プリセット選択")
-        vbox_preset = QVBoxLayout(group_preset)
+        row_top.addWidget(self.lbl_upmix_status)
+        row_top.addSpacing(10)
+        row_top.addWidget(QLabel("プリセット:"))
         preset_names = list(UPMIX_PRESETS.keys()) + [UPMIX_CUSTOM_PRESET_NAME]
         self.cmb_upmix_preset = QComboBox()
         self.cmb_upmix_preset.addItems(preset_names)
         self.cmb_upmix_preset.currentTextChanged.connect(self._upmix_on_preset_selected)
-        vbox_preset.addWidget(self.cmb_upmix_preset)
-        layout.addWidget(group_preset)
+        row_top.addWidget(self.cmb_upmix_preset, 1)
+        vbox_upmix.addLayout(row_top)
 
-        # --- 詳細パラメータ ---
-        group_params = QGroupBox("詳細パラメータ調整")
-        params_layout = QVBoxLayout(group_params)
-        params_layout.setSpacing(12)
+        # パラメータ設定グリッド
+        grid_p = QGridLayout()
+        grid_p.setHorizontalSpacing(10)
+        grid_p.setVerticalSpacing(8)
 
-        # アップミックス方式
-        row_method = QHBoxLayout()
-        row_method.addWidget(QLabel("アップミックス方式 (channelmix.upmix-method):"))
+        # 1. アップミックス方式
+        grid_p.addWidget(QLabel("方式 (method):"), 0, 0)
         self.cmb_upmix_method2 = QComboBox()
         self.cmb_upmix_method2.addItems(["psd", "simple", "none"])
         self.cmb_upmix_method2.currentTextChanged.connect(self._upmix_on_param_changed)
-        row_method.addWidget(self.cmb_upmix_method2)
-        row_method.addStretch()
-        params_layout.addLayout(row_method)
+        grid_p.addWidget(self.cmb_upmix_method2, 0, 1, 1, 2)
 
-        # LFE カットオフ
-        params_layout.addWidget(QLabel("サブウーファー LFE カットオフ (channelmix.lfe-cutoff):"))
-        row_lfe = QHBoxLayout()
+        # 2. LFE カットオフ
+        grid_p.addWidget(QLabel("LFE カットオフ:"), 1, 0)
         self.slider_upmix_lfe = QSlider(Qt.Horizontal)
         self.slider_upmix_lfe.setRange(40, 200)
         self.slider_upmix_lfe.setSingleStep(10)
         self.slider_upmix_lfe.setPageStep(10)
         self.slider_upmix_lfe.setValue(150)
         self.lbl_upmix_lfe = QLabel("150 Hz")
-        self.lbl_upmix_lfe.setMinimumWidth(70)
+        self.lbl_upmix_lfe.setMinimumWidth(60)
         self.slider_upmix_lfe.valueChanged.connect(
             lambda v: (self.lbl_upmix_lfe.setText(f"{v} Hz"), self._upmix_on_param_changed())
         )
-        row_lfe.addWidget(self.slider_upmix_lfe)
-        row_lfe.addWidget(self.lbl_upmix_lfe)
-        params_layout.addLayout(row_lfe)
+        grid_p.addWidget(self.slider_upmix_lfe, 1, 1)
+        grid_p.addWidget(self.lbl_upmix_lfe, 1, 2)
 
-        # リアスピーカーディレイ
-        params_layout.addWidget(QLabel("リアスピーカー ディレイ (channelmix.rear-delay, ms / 0=なし):"))
-        row_delay = QHBoxLayout()
+        # 3. リアディレイ
+        grid_p.addWidget(QLabel("リアディレイ:"), 2, 0)
         self.slider_upmix_delay = QSlider(Qt.Horizontal)
-        self.slider_upmix_delay.setRange(0, 500)   # 0.0～50.0ms を 10倍スケールで管理
+        self.slider_upmix_delay.setRange(0, 500)
         self.slider_upmix_delay.setSingleStep(5)
         self.slider_upmix_delay.setPageStep(50)
         self.slider_upmix_delay.setValue(0)
         self.lbl_upmix_delay = QLabel("0.0 ms")
-        self.lbl_upmix_delay.setMinimumWidth(70)
+        self.lbl_upmix_delay.setMinimumWidth(60)
         self.slider_upmix_delay.valueChanged.connect(
             lambda v: (self.lbl_upmix_delay.setText(f"{v / 10:.1f} ms"), self._upmix_on_param_changed())
         )
-        row_delay.addWidget(self.slider_upmix_delay)
-        row_delay.addWidget(self.lbl_upmix_delay)
-        params_layout.addLayout(row_delay)
+        grid_p.addWidget(self.slider_upmix_delay, 2, 1)
+        grid_p.addWidget(self.lbl_upmix_delay, 2, 2)
 
-        # センター FC カットオフ
-        params_layout.addWidget(QLabel("センター FC カットオフ (channelmix.fc-cutoff, Hz / 0=無効):"))
-        row_fc = QHBoxLayout()
+        # 4. センターFCカットオフ
+        grid_p.addWidget(QLabel("FC カットオフ:"), 3, 0)
         self.slider_upmix_fc = QSlider(Qt.Horizontal)
-        self.slider_upmix_fc.setRange(0, 40)       # 0～20000Hz を 500Hz刻みで管理
+        self.slider_upmix_fc.setRange(0, 40)
         self.slider_upmix_fc.setSingleStep(1)
         self.slider_upmix_fc.setPageStep(4)
         self.slider_upmix_fc.setValue(0)
         self.lbl_upmix_fc = QLabel("0 Hz (無効)")
-        self.lbl_upmix_fc.setMinimumWidth(110)
+        self.lbl_upmix_fc.setMinimumWidth(80)
         self.slider_upmix_fc.valueChanged.connect(
             lambda v: (
                 self.lbl_upmix_fc.setText(f"{v * 500} Hz" if v > 0 else "0 Hz (無効)"),
                 self._upmix_on_param_changed()
             )
         )
-        row_fc.addWidget(self.slider_upmix_fc)
-        row_fc.addWidget(self.lbl_upmix_fc)
-        params_layout.addLayout(row_fc)
+        grid_p.addWidget(self.slider_upmix_fc, 3, 1)
+        grid_p.addWidget(self.lbl_upmix_fc, 3, 2)
 
-        # ステレオワイド
-        params_layout.addWidget(QLabel("ステレオ背景の広がり感 (channelmix.stereo-widen, 0.00～1.00):"))
-        row_widen = QHBoxLayout()
+        # 5. ステレオワイド
+        grid_p.addWidget(QLabel("ステレオワイド:"), 4, 0)
         self.slider_upmix_widen = QSlider(Qt.Horizontal)
-        self.slider_upmix_widen.setRange(0, 20)    # 0.00～1.00 を 0.05刻みで管理
+        self.slider_upmix_widen.setRange(0, 20)
         self.slider_upmix_widen.setSingleStep(1)
         self.slider_upmix_widen.setPageStep(2)
         self.slider_upmix_widen.setValue(0)
         self.lbl_upmix_widen = QLabel("0.00")
-        self.lbl_upmix_widen.setMinimumWidth(40)
+        self.lbl_upmix_widen.setMinimumWidth(60)
         self.slider_upmix_widen.valueChanged.connect(
             lambda v: (self.lbl_upmix_widen.setText(f"{v * 0.05:.2f}"), self._upmix_on_param_changed())
         )
-        row_widen.addWidget(self.slider_upmix_widen)
-        row_widen.addWidget(self.lbl_upmix_widen)
-        params_layout.addLayout(row_widen)
+        grid_p.addWidget(self.slider_upmix_widen, 4, 1)
+        grid_p.addWidget(self.lbl_upmix_widen, 4, 2)
 
-        layout.addWidget(group_params)
+        vbox_upmix.addLayout(grid_p)
+        vbox_upmix.addStretch()
 
-        # --- ボタン群 ---
-        group_actions = QGroupBox("操作")
-        btn_layout = QHBoxLayout(group_actions)
-        btn_layout.setSpacing(10)
+        # アップミックス基本操作ボタン
+        row_upmix_btn = QHBoxLayout()
+        row_upmix_btn.setSpacing(6)
 
-        btn_enable = QPushButton("✅ 有効化 (再起動)")
-        btn_enable.setObjectName("btn_primary")
-        btn_enable.clicked.connect(self._upmix_enable)
-        btn_layout.addWidget(btn_enable)
+        self.btn_upmix_disable = QPushButton("❌ 無効化")
+        self.btn_upmix_disable.setObjectName("btn_danger")
+        self.btn_upmix_disable.clicked.connect(self._upmix_disable)
+        row_upmix_btn.addWidget(self.btn_upmix_disable)
 
-        btn_disable = QPushButton("❌ 無効化 (2ch復帰)")
-        btn_disable.setObjectName("btn_danger")
-        btn_disable.clicked.connect(self._upmix_disable)
-        btn_layout.addWidget(btn_disable)
+        self.btn_upmix_test = QPushButton("🎵 6chテスト")
+        self.btn_upmix_test.clicked.connect(self._upmix_speaker_test)
+        row_upmix_btn.addWidget(self.btn_upmix_test)
 
-        btn_test = QPushButton("🔉 スピーカーテスト (6ch)")
-        btn_test.clicked.connect(self._upmix_speaker_test)
-        btn_layout.addWidget(btn_test)
+        self.btn_upmix_enable = QPushButton("🔊 有効化 / 適用")
+        self.btn_upmix_enable.setObjectName("btn_primary")
+        self.btn_upmix_enable.clicked.connect(self._upmix_enable)
+        row_upmix_btn.addWidget(self.btn_upmix_enable, 1)
 
-        layout.addWidget(group_actions)
+        vbox_upmix.addLayout(row_upmix_btn)
+        col_left.addWidget(group_upmix)
+        layout.addLayout(col_left, 45)
 
-        # 設定ファイルパス案内
-        lbl_paths = QLabel(
-            "※ 設定ファイル: " + UPMIX_CONF_PATHS[0] + " / " + UPMIX_CONF_PATHS[1]
+        # ========================================================
+        # 右カラム: 🎯 5.1ch 個別音量 & マイク自動キャリブレーション
+        # ========================================================
+        col_right = QVBoxLayout()
+        col_right.setSpacing(10)
+
+        group_calib = QGroupBox("🎯 5.1ch 音響キャリブレーション & 音量バランス")
+        vbox_calib = QVBoxLayout(group_calib)
+        vbox_calib.setContentsMargins(12, 14, 12, 12)
+        vbox_calib.setSpacing(8)
+
+        desc_calib = QLabel("各スピーカーからテスト音を鳴らし、マイク測定で全chの音量を均一化します。")
+        desc_calib.setStyleSheet("color: #a6adc8; font-size: 8.5pt;")
+        vbox_calib.addWidget(desc_calib)
+
+        # 測定マイク & テスト音量
+        row_c_conf = QHBoxLayout()
+        row_c_conf.setSpacing(6)
+        row_c_conf.addWidget(QLabel("マイク:"))
+        self.cmb_calib_mic = QComboBox()
+        self.cmb_calib_mic.setMinimumWidth(130)
+        self.btn_calib_mic_refresh = QPushButton("🔄")
+        self.btn_calib_mic_refresh.setFixedWidth(32)
+        self.btn_calib_mic_refresh.clicked.connect(self._calib_refresh_mics)
+        row_c_conf.addWidget(self.cmb_calib_mic, 1)
+        row_c_conf.addWidget(self.btn_calib_mic_refresh)
+
+        row_c_conf.addSpacing(6)
+        row_c_conf.addWidget(QLabel("音量:"))
+        self.slider_calib_vol = QSlider(Qt.Horizontal)
+        self.slider_calib_vol.setRange(5, 50)
+        self.slider_calib_vol.setValue(15)
+        self.lbl_calib_vol = QLabel("15%")
+        self.lbl_calib_vol.setMinimumWidth(40)
+        self.slider_calib_vol.valueChanged.connect(
+            lambda v: self.lbl_calib_vol.setText(f"{v}%")
         )
-        lbl_paths.setStyleSheet("color: #a6adc8; font-style: italic; font-size: 9pt;")
-        layout.addWidget(lbl_paths)
+        row_c_conf.addWidget(self.slider_calib_vol)
+        row_c_conf.addWidget(self.lbl_calib_vol)
+        vbox_calib.addLayout(row_c_conf)
 
-        layout.addStretch()
+        # 測定ステータス & 制御ボタン
+        row_c_act = QHBoxLayout()
+        row_c_act.setSpacing(6)
+        self.lbl_calib_status = QLabel(" 準備完了 ")
+        self.lbl_calib_status.setObjectName("status_badge")
+        self.lbl_calib_status.setStyleSheet("background-color: #313244; color: #a6adc8; border-radius: 6px; padding: 4px 8px;")
+        row_c_act.addWidget(self.lbl_calib_status, 1)
 
-        # 現在の設定ファイルの値で UI を初期化
+        self.btn_calib_stop = QPushButton("⏹️ 中止")
+        self.btn_calib_stop.setObjectName("btn_danger")
+        self.btn_calib_stop.setEnabled(False)
+        self.btn_calib_stop.clicked.connect(self._calib_stop)
+        row_c_act.addWidget(self.btn_calib_stop)
+
+        self.btn_calib_start = QPushButton("🎙️ 自動測定開始")
+        self.btn_calib_start.setObjectName("btn_primary")
+        self.btn_calib_start.clicked.connect(self._calib_start)
+        row_c_act.addWidget(self.btn_calib_start)
+        vbox_calib.addLayout(row_c_act)
+
+        # 6チャンネル個別音量スライダー (2列 x 3行グリッド)
+        grid_channels = QGridLayout()
+        grid_channels.setHorizontalSpacing(12)
+        grid_channels.setVerticalSpacing(4)
+        
+        self.calib_sliders = []
+        self.lbl_calib_values = []
+        self.lbl_calib_measures = []
+
+        for idx, (ch_id, ch_label) in enumerate(CHANNEL_NAMES):
+            col_offset = (idx % 2) * 4
+            row = idx // 2
+
+            lbl_title = QLabel(f"<b>{ch_label}</b>")
+            lbl_meas = QLabel("測定: --")
+            lbl_meas.setStyleSheet("color: #a6adc8; font-size: 8pt;")
+            
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(20, 180)
+            slider.setValue(100)
+            
+            lbl_val = QLabel("100%")
+            lbl_val.setMinimumWidth(38)
+            lbl_val.setStyleSheet("font-size: 9pt;")
+            slider.valueChanged.connect(
+                (lambda l_val: lambda v: l_val.setText(f"{v}%"))(lbl_val)
+            )
+
+            self.calib_sliders.append(slider)
+            self.lbl_calib_values.append(lbl_val)
+            self.lbl_calib_measures.append(lbl_meas)
+
+            grid_channels.addWidget(lbl_title, row * 2, col_offset)
+            grid_channels.addWidget(lbl_meas, row * 2, col_offset + 1, 1, 2, Qt.AlignRight)
+            grid_channels.addWidget(slider, row * 2 + 1, col_offset, 1, 2)
+            grid_channels.addWidget(lbl_val, row * 2 + 1, col_offset + 2)
+
+        vbox_calib.addLayout(grid_channels)
+        vbox_calib.addStretch()
+
+        # 音量適用ボタン
+        row_apply = QHBoxLayout()
+        row_apply.setSpacing(6)
+        self.btn_calib_reset = QPushButton("🔄 100%リセット")
+        self.btn_calib_reset.clicked.connect(self._calib_reset_flat)
+        row_apply.addWidget(self.btn_calib_reset)
+
+        self.btn_calib_apply = QPushButton("💾 音量をPipeWireに適用")
+        self.btn_calib_apply.setObjectName("btn_primary")
+        self.btn_calib_apply.clicked.connect(self._calib_apply_volumes)
+        row_apply.addWidget(self.btn_calib_apply, 1)
+        vbox_calib.addLayout(row_apply)
+
+        col_right.addWidget(group_calib)
+        layout.addLayout(col_right, 55)
+
+        # 初期化
+        self._calib_worker = None
+        self._calib_refresh_mics()
         self._upmix_load_from_file()
+        self._calib_load_current_volumes()
 
         return tab
 
     def _upmix_get_params(self) -> dict:
-        """UI の現在値をパラメータ辞書として返す。"""
+        """UI の現在の入力値を辞書で取得する。"""
         return {
             "method": self.cmb_upmix_method2.currentText(),
             "lfe_cutoff": self.slider_upmix_lfe.value(),
@@ -1202,23 +1383,6 @@ class GUIPipeWireWindow(QMainWindow):
         self.cmb_upmix_preset.setCurrentText(UPMIX_CUSTOM_PRESET_NAME)
         self._upmix_updating = False
 
-    def _upmix_refresh_status_badge(self):
-        """有効/無効状態バッジを更新する。"""
-        if upmix_is_enabled():
-            self.lbl_upmix_status.setText(" ● 有効 (5.1ch Upmix ON) ")
-            self.lbl_upmix_status.setStyleSheet(
-                "background-color: #a6e3a1; color: #11111b; "
-                "padding: 4px 10px; border-radius: 12px; font-weight: bold;"
-            )
-        else:
-            self.lbl_upmix_status.setText(" ✖ 無効 (標準 2ch Direct) ")
-            self.lbl_upmix_status.setStyleSheet(
-                "background-color: #f38ba8; color: #11111b; "
-                "padding: 4px 10px; border-radius: 12px; font-weight: bold;"
-            )
-
-    # ------ シグナルハンドラ ------
-
     def _upmix_on_preset_selected(self, preset_name: str):
         """プリセット選択時: パラメータを一括反映する。"""
         if self._upmix_updating:
@@ -1232,13 +1396,26 @@ class GUIPipeWireWindow(QMainWindow):
             return
         self._upmix_detect_preset()
 
-    # ------ ボタン操作 ------
+    def _upmix_refresh_status_badge(self):
+        """有効/無効状態バッジを更新する。"""
+        if upmix_is_enabled():
+            self.lbl_upmix_status.setText(" ● 5.1ch Upmix ON ")
+            self.lbl_upmix_status.setStyleSheet(
+                "background-color: #a6e3a1; color: #11111b; "
+                "padding: 3px 8px; border-radius: 6px; font-weight: bold;"
+            )
+        else:
+            self.lbl_upmix_status.setText(" ○ 2ch Direct (無効) ")
+            self.lbl_upmix_status.setStyleSheet(
+                "background-color: #313244; color: #a6adc8; "
+                "padding: 3px 8px; border-radius: 6px;"
+            )
 
     def _upmix_enable(self):
-        """現在の UI パラメータで設定ファイルを書き込み、PipeWire を再起動する。"""
-        params = self._upmix_get_params()
-        conf_content = upmix_generate_config(params)
+        """5.1ch アップミックス設定を適用して PipeWire を再起動する。"""
         try:
+            params = self._upmix_get_params()
+            conf_content = upmix_generate_config(params)
             for path in UPMIX_CONF_PATHS:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w", encoding="utf-8") as f:
@@ -1249,19 +1426,15 @@ class GUIPipeWireWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "有効化 完了",
-                f"5.1ch アップミックス設定を適用しました。\nPipeWire を再起動しました。\n\n"
-                f"[設定値]\n"
-                f"方式            : {params['method']}\n"
-                f"LFE カットオフ  : {params['lfe_cutoff']} Hz\n"
-                f"リアディレイ    : {params['rear_delay']:.1f} ms\n"
-                f"FC カットオフ   : {params['fc_cutoff']} Hz\n"
-                f"ステレオワイド  : {params['stereo_widen']:.2f}",
+                "5.1ch アップミックス設定を適用しました。\nPipeWire を再起動しました。\n\n" + 
+                f"[設定値]\n方式: {params[method]}\nLFE: {params[lfe_cutoff]}Hz\nRear: {params[rear_delay]:.1f}ms\nFC: {params[fc_cutoff]}Hz\nWiden: {params[stereo_widen]:.2f}"
             )
         except Exception as e:
+            self._mic_log(f"アップミックス適用エラー: {e}")
             QMessageBox.critical(self, "エラー", str(e))
 
     def _upmix_disable(self):
-        """設定ファイルを削除し PipeWire を再起動してアップミックスを無効化する。"""
+        """5.1ch アップミックス設定ファイルを削除して PipeWire を再起動する。"""
         removed = []
         try:
             for path in UPMIX_CONF_PATHS:
@@ -1277,7 +1450,7 @@ class GUIPipeWireWindow(QMainWindow):
                 "5.1ch アップミックスを無効化し、標準 2ch Direct に戻しました。\nPipeWire を再起動しました。",
             )
         except Exception as e:
-            # 削除済みファイルをロールバック
+            self._mic_log(f"アップミックス無効化エラー: {e}")
             params = self._upmix_get_params()
             conf_content = upmix_generate_config(params)
             for path in removed:
@@ -1289,7 +1462,7 @@ class GUIPipeWireWindow(QMainWindow):
                     pass
             QMessageBox.critical(
                 self, "エラー",
-                f"無効化に失敗しました（変更を元に戻しました）:\n{e}"
+                f"無効化に失敗しました（変更を元に戻しました）: {e}"
             )
 
     def _upmix_speaker_test(self):
@@ -1305,4 +1478,556 @@ class GUIPipeWireWindow(QMainWindow):
                 "speaker-test コマンドが見つかりません。\nalsa-utils をインストールしてください。",
             )
         except Exception as e:
+            self._mic_log(f"テスト音再生エラー: {e}")
             QMessageBox.critical(self, "エラー", f"テストの実行に失敗しました: {e}")
+
+    # ------ 5.1ch キャリブレーション関連ハンドラ ------
+
+    def _calib_refresh_mics(self):
+        """マイク一覧を取得してキャリブレーション用コンボボックスに設定"""
+        self.cmb_calib_mic.blockSignals(True)
+        self.cmb_calib_mic.clear()
+        self.cmb_calib_mic.addItem("デフォルトマイク (Default)", "default")
+        try:
+            import pulsectl
+            with pulsectl.Pulse('guipipewire-calib-list') as pulse:
+                for src in pulse.source_list():
+                    if not src.name.endswith(".monitor"):
+                        desc = src.description or src.name
+                        self.cmb_calib_mic.addItem(f"{desc}", src.name)
+        except Exception:
+            pass
+        self.cmb_calib_mic.blockSignals(False)
+
+    def _calib_start(self):
+        """5.1ch 自動キャリブレーション測定を開始"""
+        if self._calib_worker and self._calib_worker.isRunning():
+            return
+
+        mic_name = self.cmb_calib_mic.currentData()
+        vol = self.slider_calib_vol.value() / 100.0
+
+        self.btn_calib_start.setEnabled(False)
+        self.btn_calib_stop.setEnabled(True)
+        self.lbl_calib_status.setText(" 🚀 測定中: 静粛にお待ちください... ")
+        self.lbl_calib_status.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; border-radius: 6px; padding: 4px 8px;")
+
+        for lbl in self.lbl_calib_measures:
+            lbl.setText("測定: 待機中...")
+
+        self._calib_worker = CalibrationWorkerThread(
+            sink_name="default",
+            mic_source_name=mic_name,
+            test_volume=vol,
+            parent=self
+        )
+        self._calib_worker.progress_updated.connect(self._calib_on_progress)
+        self._calib_worker.step_result.connect(self._calib_on_step_result)
+        self._calib_worker.finished_calibration.connect(self._calib_on_finished)
+        self._calib_worker.error_occurred.connect(self._calib_on_error)
+        self._calib_worker.start()
+
+    def _calib_stop(self):
+        """測定を中止"""
+        if self._calib_worker:
+            self._calib_worker.stop()
+            self._calib_worker.wait(1000)
+        self.btn_calib_start.setEnabled(True)
+        self.btn_calib_stop.setEnabled(False)
+        self.lbl_calib_status.setText(" ⏹️ 中止しました ")
+        self.lbl_calib_status.setStyleSheet("background-color: #313244; color: #a6adc8; border-radius: 6px; padding: 4px 8px;")
+
+    def _calib_on_progress(self, step_idx, ch_name, status_msg):
+        if step_idx == 0:
+            self.lbl_calib_status.setText(f" 🔇 {status_msg} ")
+        elif 1 <= step_idx <= 6:
+            self.lbl_calib_status.setText(f" 🔊 [{step_idx}/6] {status_msg} ")
+        else:
+            self.lbl_calib_status.setText(f" 🎉 {status_msg} ")
+
+    def _calib_on_step_result(self, ch_idx, measured_db):
+        if 0 <= ch_idx < len(self.lbl_calib_measures):
+            self.lbl_calib_measures[ch_idx].setText(f"測定: {measured_db:.1f} dBFS")
+
+    def _calib_on_finished(self, results):
+        self.btn_calib_start.setEnabled(True)
+        self.btn_calib_stop.setEnabled(False)
+        self.lbl_calib_status.setText(" 🎉 測定完了！ 推奨音量を反映 ")
+        self.lbl_calib_status.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; border-radius: 6px; padding: 4px 8px;")
+
+        rec_vols = results.get("recommended_volumes", [1.0] * 6)
+        gain_diffs = results.get("gain_diffs_db", [0.0] * 6)
+
+        for idx, vol in enumerate(rec_vols):
+            if idx < len(self.calib_sliders):
+                val_int = int(round(vol * 100))
+                self.calib_sliders[idx].setValue(val_int)
+                diff = gain_diffs[idx] if idx < len(gain_diffs) else 0.0
+                sign = "+" if diff >= 0 else ""
+                meas_db = results["measured_dbs"][idx] if idx < len(results["measured_dbs"]) else -90.0
+                self.lbl_calib_measures[idx].setText(
+                    f"{meas_db:.1f} dBFS ({sign}{diff:.1f} dB)"
+                )
+
+        QMessageBox.information(
+            self,
+            "キャリブレーション完了",
+            "5.1ch 全スピーカーの測定が完了しました！\n\n"
+            "リスニング位置で各スピーカーの音量が均一になるよう、\n"
+            "自動計算された推奨音量をスライダーに反映しました。\n\n"
+            "「💾 音量をPipeWireに適用」を押すと反映されます。"
+        )
+
+    def _calib_on_error(self, err_msg):
+        self.btn_calib_start.setEnabled(True)
+        self.btn_calib_stop.setEnabled(False)
+        self.lbl_calib_status.setText(f" ⚠️ エラー: {err_msg} ")
+        self.lbl_calib_status.setStyleSheet("background-color: #f38ba8; color: #11111b; font-weight: bold; border-radius: 6px; padding: 4px 8px;")
+        QMessageBox.critical(self, "エラー", err_msg)
+
+    def _calib_apply_volumes(self):
+        """現在の 6ch スライダーの音量値を PipeWire / PulseAudio に即時適用"""
+        volumes = [s.value() / 100.0 for s in self.calib_sliders]
+        try:
+            apply_51ch_channel_volumes("default", volumes)
+            vol_str = ", ".join([f"{CHANNEL_NAMES[i][0]}: {int(volumes[i]*100)}%" for i in range(len(volumes))])
+            QMessageBox.information(
+                self,
+                "音量適用完了",
+                f"5.1ch 各チャンネルの音量を即時適用しました！\n\n{vol_str}"
+            )
+        except Exception as e:
+            self._mic_log(f"音量適用エラー: {e}")
+            QMessageBox.critical(self, "エラー", f"音量の適用に失敗しました: {e}")
+
+    def _calib_load_current_volumes(self):
+        """PipeWire / PulseAudio の現在の 5.1ch 各チャンネル音量を取得してスライダーに反映"""
+        try:
+            vols = get_51ch_channel_volumes("default")
+            for idx, vol in enumerate(vols):
+                if idx < len(self.calib_sliders):
+                    val_int = int(round(vol * 100))
+                    self.calib_sliders[idx].blockSignals(True)
+                    self.calib_sliders[idx].setValue(val_int)
+                    self.calib_sliders[idx].blockSignals(False)
+                    if idx < len(self.lbl_calib_values):
+                        self.lbl_calib_values[idx].setText(f"{val_int}%")
+        except Exception:
+            pass
+
+    def _calib_reset_flat(self):
+        """全チャンネルの音量を 100% (フラット) にリセット"""
+        for slider in self.calib_sliders:
+            slider.setValue(100)
+        try:
+            apply_51ch_channel_volumes("default", [1.0] * 6)
+            QMessageBox.information(
+                self,
+                "リセット完了",
+                "全チャンネルの音量を 100% (フラット) にリセットしました。"
+            )
+        except Exception as e:
+            self._mic_log(f"音量リセットエラー: {e}")
+            QMessageBox.critical(self, "エラー", f"リセットに失敗しました: {e}")
+
+
+    # ============================================================
+    # タブ: 🎙️ マイク & AGC (自動音量均一化)
+    # ============================================================
+
+    def _create_mic_agc_tab(self):
+        """マイク設定 & AGC タブを生成 (スクロール不要の2カラム構成)"""
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        # ========================================================
+        # 左カラム: マイクモニター & PipeWire 仮想マイク AGC (WebRTC)
+        # ========================================================
+        col_left = QVBoxLayout()
+        col_left.setSpacing(10)
+
+        # 1. マイク入力 & モニター
+        group_meter = QGroupBox("🎙️ マイク入力 & モニター")
+        vbox_meter = QVBoxLayout(group_meter)
+        vbox_meter.setContentsMargins(12, 14, 12, 12)
+        vbox_meter.setSpacing(8)
+
+        # デバイス選択
+        row_dev = QHBoxLayout()
+        row_dev.setSpacing(6)
+        row_dev.addWidget(QLabel("デバイス:"))
+        self.cmb_mic_source = QComboBox()
+        self.btn_refresh_mics = QPushButton("🔄")
+        self.btn_refresh_mics.setFixedWidth(32)
+        self.btn_refresh_mics.clicked.connect(self._mic_refresh_sources)
+        row_dev.addWidget(self.cmb_mic_source, 1)
+        row_dev.addWidget(self.btn_refresh_mics)
+        vbox_meter.addLayout(row_dev)
+
+        # レベルメーター & 判定バッジ
+        row_progress = QHBoxLayout()
+        row_progress.setSpacing(6)
+        self.prog_mic_level = QProgressBar()
+        self.prog_mic_level.setRange(0, 100)
+        self.prog_mic_level.setValue(0)
+        self.prog_mic_level.setTextVisible(True)
+        self.prog_mic_level.setFormat("-∞ dBFS")
+        self.prog_mic_level.setFixedHeight(18)
+        row_progress.addWidget(self.prog_mic_level, 1)
+
+        self.lbl_mic_clip = QLabel(" 正常 ")
+        self.lbl_mic_clip.setObjectName("status_badge")
+        self.lbl_mic_clip.setStyleSheet("background-color: #313244; color: #a6adc8; border-radius: 6px; padding: 2px 6px;")
+        row_progress.addWidget(self.lbl_mic_clip)
+        vbox_meter.addLayout(row_progress)
+
+        # 数値詳細
+        self.lbl_mic_db_detail = QLabel("実効 (RMS): -∞ dBFS | ピーク: -∞ dBFS | ゲイン: 100%")
+        self.lbl_mic_db_detail.setStyleSheet("color: #a6adc8; font-size: 8.5pt;")
+        vbox_meter.addWidget(self.lbl_mic_db_detail)
+
+        # マイク手動音量 (Gain)
+        row_gain = QHBoxLayout()
+        row_gain.setSpacing(6)
+        row_gain.addWidget(QLabel("手動Gain:"))
+        self.slider_mic_gain = QSlider(Qt.Horizontal)
+        self.slider_mic_gain.setRange(0, 150)
+        self.slider_mic_gain.setValue(100)
+        self.lbl_mic_gain_val = QLabel("100%")
+        self.lbl_mic_gain_val.setMinimumWidth(40)
+        self.slider_mic_gain.valueChanged.connect(self._mic_on_gain_slider_changed)
+        row_gain.addWidget(self.slider_mic_gain, 1)
+        row_gain.addWidget(self.lbl_mic_gain_val)
+        vbox_meter.addLayout(row_gain)
+
+        col_left.addWidget(group_meter)
+
+        # 2. PipeWire 仮想マイク AGC (WebRTC DSP)
+        group_hw_agc = QGroupBox("⚡ PipeWire 仮想マイク AGC (WebRTC DSP)")
+        vbox_hw = QVBoxLayout(group_hw_agc)
+        vbox_hw.setContentsMargins(12, 14, 12, 12)
+        vbox_hw.setSpacing(8)
+
+        desc_hw = QLabel("小声増幅・大声抑制・AIノイズ除去をOS仮想マイクで適用します。")
+        desc_hw.setStyleSheet("color: #a6adc8; font-size: 8.5pt;")
+        vbox_hw.addWidget(desc_hw)
+
+        grid_opts = QGridLayout()
+        grid_opts.setHorizontalSpacing(10)
+        grid_opts.setVerticalSpacing(4)
+        self.chk_webrtc_agc = QCheckBox("自動ゲイン (AGC)")
+        self.chk_webrtc_agc.setChecked(True)
+        self.chk_webrtc_noise = QCheckBox("AI ノイズ抑制")
+        self.chk_webrtc_noise.setChecked(True)
+        self.chk_webrtc_highpass = QCheckBox("ハイパスフィルター")
+        self.chk_webrtc_highpass.setChecked(True)
+        self.chk_webrtc_vad = QCheckBox("音声検知 (VAD)")
+        self.chk_webrtc_vad.setChecked(True)
+
+        grid_opts.addWidget(self.chk_webrtc_agc, 0, 0)
+        grid_opts.addWidget(self.chk_webrtc_noise, 0, 1)
+        grid_opts.addWidget(self.chk_webrtc_highpass, 1, 0)
+        grid_opts.addWidget(self.chk_webrtc_vad, 1, 1)
+        vbox_hw.addLayout(grid_opts)
+
+        row_hw_btn = QHBoxLayout()
+        row_hw_btn.setSpacing(6)
+        self.lbl_hw_status = QLabel(" 状態確認中... ")
+        self.lbl_hw_status.setObjectName("status_badge")
+        row_hw_btn.addWidget(self.lbl_hw_status, 1)
+
+        self.btn_hw_disable = QPushButton("❌ 無効化")
+        self.btn_hw_disable.setObjectName("btn_danger")
+        self.btn_hw_disable.clicked.connect(self._mic_disable_hardware_agc)
+        row_hw_btn.addWidget(self.btn_hw_disable)
+
+        self.btn_hw_enable = QPushButton("🎙️ 仮想マイク有効化")
+        self.btn_hw_enable.setObjectName("btn_primary")
+        self.btn_hw_enable.clicked.connect(self._mic_enable_hardware_agc)
+        row_hw_btn.addWidget(self.btn_hw_enable)
+        vbox_hw.addLayout(row_hw_btn)
+
+        col_left.addWidget(group_hw_agc)
+        col_left.addStretch()
+        layout.addLayout(col_left, 50)
+
+        # ========================================================
+        # 右カラム: リアルタイム動的追従 & 夜間テスト
+        # ========================================================
+        col_right = QVBoxLayout()
+        col_right.setSpacing(10)
+
+        # 3. リアルタイム動的ゲイン追従
+        group_soft = QGroupBox("🎛️ 動的ゲイン自動追従 (ソフトウェア制御)")
+        vbox_soft = QVBoxLayout(group_soft)
+        vbox_soft.setContentsMargins(12, 14, 12, 12)
+        vbox_soft.setSpacing(8)
+
+        self.chk_soft_agc_enable = QCheckBox("リアルタイム動的ゲイン追従を有効化")
+        self.chk_soft_agc_enable.toggled.connect(self._mic_on_soft_agc_toggled)
+        vbox_soft.addWidget(self.chk_soft_agc_enable)
+
+        # 目標音量 Target dBFS
+        row_target = QHBoxLayout()
+        row_target.setSpacing(6)
+        row_target.addWidget(QLabel("目標音量:"))
+        self.slider_target_db = QSlider(Qt.Horizontal)
+        self.slider_target_db.setRange(-30, -10)
+        self.slider_target_db.setValue(-18)
+        self.lbl_target_db = QLabel("-18 dBFS")
+        self.lbl_target_db.setMinimumWidth(55)
+        self.slider_target_db.valueChanged.connect(
+            lambda v: (self.lbl_target_db.setText(f"{v} dBFS"), self._mic_update_soft_params())
+        )
+        row_target.addWidget(self.slider_target_db, 1)
+        row_target.addWidget(self.lbl_target_db)
+        vbox_soft.addLayout(row_target)
+
+        # 無音ノイズ閾値
+        row_floor = QHBoxLayout()
+        row_floor.setSpacing(6)
+        row_floor.addWidget(QLabel("ノイズ閾値:"))
+        self.slider_noise_floor = QSlider(Qt.Horizontal)
+        self.slider_noise_floor.setRange(-60, -30)
+        self.slider_noise_floor.setValue(-48)
+        self.lbl_noise_floor = QLabel("-48 dBFS")
+        self.lbl_noise_floor.setMinimumWidth(55)
+        self.slider_noise_floor.valueChanged.connect(
+            lambda v: (self.lbl_noise_floor.setText(f"{v} dBFS"), self._mic_update_soft_params())
+        )
+        row_floor.addWidget(self.slider_noise_floor, 1)
+        row_floor.addWidget(self.lbl_noise_floor)
+        vbox_soft.addLayout(row_floor)
+
+        # AGC 動作ログ (コンパクト)
+        self.txt_agc_log = QTextEdit()
+        self.txt_agc_log.setReadOnly(True)
+        self.txt_agc_log.setFixedHeight(50)
+        self.txt_agc_log.setStyleSheet("background-color: #11111b; color: #a6e3a1; font-family: monospace; font-size: 8pt; border: 1px solid #313244; border-radius: 4px; padding: 4px;")
+        vbox_soft.addWidget(self.txt_agc_log)
+
+        col_right.addWidget(group_soft)
+
+        # 4. 夜間・静音テスト支援モード
+        group_night = QGroupBox("🌙 夜間・静音テスト支援モード")
+        vbox_night = QVBoxLayout(group_night)
+        vbox_night.setContentsMargins(12, 14, 12, 12)
+        vbox_night.setSpacing(8)
+
+        lbl_night_desc = QLabel("囁き声での増幅テストや、極小音量テストトーンの注入が可能です。")
+        lbl_night_desc.setStyleSheet("color: #a6adc8; font-size: 8.5pt;")
+        vbox_night.addWidget(lbl_night_desc)
+
+        row_night_act = QHBoxLayout()
+        row_night_act.setSpacing(6)
+        self.lbl_quiet_detect = QLabel(" 🌙 夜間小声: 待機中 ")
+        self.lbl_quiet_detect.setStyleSheet("background-color: #313244; color: #a6adc8; border-radius: 6px; padding: 4px 8px; font-size: 8.5pt;")
+        row_night_act.addWidget(self.lbl_quiet_detect, 1)
+
+        self.btn_night_sim = QPushButton("🧪 擬似テスト音")
+        self.btn_night_sim.clicked.connect(self._mic_play_night_test_tone)
+        row_night_act.addWidget(self.btn_night_sim)
+        vbox_night.addLayout(row_night_act)
+
+        col_right.addWidget(group_night)
+        col_right.addStretch()
+        layout.addLayout(col_right, 50)
+
+        # 初期化処理
+        self._mic_refresh_sources()
+        self._mic_refresh_hw_status()
+        self._mic_start_monitor()
+
+        self.cmb_mic_source.currentIndexChanged.connect(self._mic_on_source_selected)
+
+        return tab
+
+    def _mic_refresh_hw_status(self):
+        """Hardware AGC の有効/無効状態バッジを更新"""
+        if self.agc_mgr.is_hardware_agc_enabled():
+            self.lbl_hw_status.setText(" ● 仮想マイク有効 ")
+            self.lbl_hw_status.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; border-radius: 6px; padding: 3px 8px;")
+        else:
+            self.lbl_hw_status.setText(" ○ 仮想マイク無効 ")
+            self.lbl_hw_status.setStyleSheet("background-color: #313244; color: #a6adc8; border-radius: 6px; padding: 3px 8px;")
+
+    def _mic_refresh_sources(self):
+        """マイク入力デバイス一覧を取得してコンボボックスに設定"""
+        self.cmb_mic_source.blockSignals(True)
+        self.cmb_mic_source.clear()
+        self.cmb_mic_source.addItem("デフォルトマイク (Default)", "default")
+        try:
+            import pulsectl
+            with pulsectl.Pulse('guipipewire-mic-list') as pulse:
+                for src in pulse.source_list():
+                    if not src.name.endswith(".monitor"):
+                        desc = src.description or src.name
+                        self.cmb_mic_source.addItem(f"{desc}", src.name)
+        except Exception:
+            pass
+        self.cmb_mic_source.blockSignals(False)
+
+    def _mic_start_monitor(self):
+        """マイクレベル監視スレッドを起動"""
+        if hasattr(self, 'mic_monitor_thread') and self.mic_monitor_thread:
+            self.mic_monitor_thread.stop()
+            self.mic_monitor_thread.wait(500)
+
+        source_name = self.cmb_mic_source.currentData() or "default"
+        self.mic_monitor_thread = MicrophoneMonitorThread(source_name=source_name, parent=self)
+        self.mic_monitor_thread.level_updated.connect(self._mic_on_level_updated)
+        self.mic_monitor_thread.agc_action.connect(self._mic_log)
+        self._mic_update_soft_params()
+        self.mic_monitor_thread.start()
+
+    def _mic_on_source_selected(self):
+        """選択マイクが切り替わったときの処理"""
+        self._mic_start_monitor()
+
+    def _mic_update_soft_params(self):
+        """Software AGC のパラメータをスレッドに反映"""
+        if hasattr(self, 'mic_monitor_thread') and self.mic_monitor_thread:
+            enabled = self.chk_soft_agc_enable.isChecked()
+            target = float(self.slider_target_db.value())
+            noise_floor = float(self.slider_noise_floor.value())
+            self.mic_monitor_thread.set_agc_params(
+                enabled=enabled,
+                target_db=target,
+                noise_floor_db=noise_floor,
+                max_gain=1.5
+            )
+
+    def _mic_on_soft_agc_toggled(self, checked):
+        self._mic_update_soft_params()
+        if checked:
+            self._mic_log("[AGC] リアルタイム動的ゲイン追従を開始しました")
+        else:
+            self._mic_log("[AGC] リアルタイム動的ゲイン追従を停止しました")
+
+    def _mic_on_gain_slider_changed(self, val):
+        """マイク音量手動スライダー変更"""
+        self.lbl_mic_gain_val.setText(f"{val}%")
+        if not self.chk_soft_agc_enable.isChecked():
+            try:
+                import pulsectl
+                with pulsectl.Pulse('guipipewire-gain-set') as pulse:
+                    source_name = self.cmb_mic_source.currentData()
+                    if source_name == "default":
+                        source_name = pulse.server_info().default_source_name
+                    src = pulse.get_source_by_name(source_name)
+                    if src:
+                        pulse.volume_set_all_chans(src, val / 100.0)
+            except Exception:
+                pass
+
+    def _mic_on_level_updated(self, rms_db, peak_db, current_vol, is_clipping):
+        """マイクレベル監視スレッドからのシグナル受信 (Catppuccin Mocha テーマ調和配色)"""
+        progress_val = max(0, min(100, int((rms_db + 60.0) * (100.0 / 60.0))))
+        self.prog_mic_level.setValue(progress_val)
+        self.prog_mic_level.setFormat(f"{rms_db:.1f} dBFS")
+
+        self.lbl_mic_db_detail.setText(
+            f"実効 (RMS): {rms_db:.1f} dBFS | ピーク: {peak_db:.1f} dBFS | ゲイン: {int(current_vol * 100)}%"
+        )
+
+        # クリッピング / 音量状態バッジ (統一カラーパレット)
+        if is_clipping or peak_db > -2.0:
+            self.lbl_mic_clip.setText(" ⚠️ 音割れ ")
+            self.lbl_mic_clip.setStyleSheet("background-color: #f38ba8; color: #11111b; font-weight: bold; border-radius: 6px; padding: 2px 6px;")
+        elif rms_db > -18.0:
+            self.lbl_mic_clip.setText(" 🔊 大 ")
+            self.lbl_mic_clip.setStyleSheet("background-color: #fab387; color: #11111b; font-weight: bold; border-radius: 6px; padding: 2px 6px;")
+        elif rms_db > -35.0:
+            self.lbl_mic_clip.setText(" ● 適正 ")
+            self.lbl_mic_clip.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; border-radius: 6px; padding: 2px 6px;")
+        elif rms_db > -50.0:
+            self.lbl_mic_clip.setText(" 🔈 小声 ")
+            self.lbl_mic_clip.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; border-radius: 6px; padding: 2px 6px;")
+        else:
+            self.lbl_mic_clip.setText(" 無音 ")
+            self.lbl_mic_clip.setStyleSheet("background-color: #313244; color: #a6adc8; border-radius: 6px; padding: 2px 6px;")
+
+        # 夜間小声テストインジケーター
+        if -45.0 < rms_db < -25.0:
+            self.lbl_quiet_detect.setText(f" 🌙 小声を検知 ({rms_db:.1f} dBFS): 増幅動作中 ")
+            self.lbl_quiet_detect.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; border-radius: 6px; padding: 4px 8px; font-size: 8.5pt;")
+        elif rms_db >= -25.0:
+            self.lbl_quiet_detect.setText(f" 🔊 通常入力 ({rms_db:.1f} dBFS) ")
+            self.lbl_quiet_detect.setStyleSheet("background-color: #313244; color: #cdd6f4; border-radius: 6px; padding: 4px 8px; font-size: 8.5pt;")
+        else:
+            self.lbl_quiet_detect.setText(" 🌙 夜間小声: 待機中 ")
+            self.lbl_quiet_detect.setStyleSheet("background-color: #313244; color: #a6adc8; border-radius: 6px; padding: 4px 8px; font-size: 8.5pt;")
+
+        if self.chk_soft_agc_enable.isChecked():
+            self.slider_mic_gain.blockSignals(True)
+            self.slider_mic_gain.setValue(int(current_vol * 100))
+            self.lbl_mic_gain_val.setText(f"{int(current_vol * 100)}%")
+            self.slider_mic_gain.blockSignals(False)
+
+    def _mic_enable_hardware_agc(self):
+        """PipeWire WebRTC AGC 仮想マイクの有効化"""
+        try:
+            conf_path = self.agc_mgr.enable_hardware_agc(
+                gain_control=self.chk_webrtc_agc.isChecked(),
+                noise_suppression=self.chk_webrtc_noise.isChecked(),
+                high_pass=self.chk_webrtc_highpass.isChecked(),
+                voice_detection=self.chk_webrtc_vad.isChecked()
+            )
+            self.service_mgr.restart_pipewire()
+            self._mic_refresh_hw_status()
+            self._mic_refresh_sources()
+            self.update_live_status()
+            self._mic_log(f"WebRTC AGC 仮想マイクを有効化しました: {conf_path}")
+            QMessageBox.information(
+                self,
+                "AGC 仮想マイク 有効化",
+                "PipeWire WebRTC DSP (AGC & ノイズ抑制) 仮想マイクを作成・適用しました。\n"
+                "PipeWire を再起動しました。\n\n"
+                "Discord、OBS、ブラウザ等の入力デバイス一覧に\n"
+                "「マイク (AGC・ノイズ抑制適用済み)」が表示されます。"
+            )
+        except Exception as e:
+            self._mic_log(f"AGC有効化エラー: {e}")
+            QMessageBox.critical(self, "エラー", f"AGC 有効化に失敗しました: {e}")
+
+    def _mic_disable_hardware_agc(self):
+        """PipeWire WebRTC AGC 仮想マイクの無効化"""
+        try:
+            self.agc_mgr.disable_hardware_agc()
+            self.service_mgr.restart_pipewire()
+            self._mic_refresh_hw_status()
+            self._mic_refresh_sources()
+            self.update_live_status()
+            self._mic_log("WebRTC AGC 仮想マイクを無効化しました")
+            QMessageBox.information(
+                self,
+                "AGC 仮想マイク 無効化",
+                "WebRTC AGC 仮想マイクを無効化しました。\nPipeWire を再起動しました。"
+            )
+        except Exception as e:
+            self._mic_log(f"AGC無効化エラー: {e}")
+            QMessageBox.critical(self, "エラー", f"AGC 無効化に失敗しました: {e}")
+
+    def _mic_log(self, msg):
+        """AGC ログ追記"""
+        self.txt_agc_log.append(msg)
+
+    def _mic_play_night_test_tone(self):
+        """夜間用の極小音量テストトーン (1kHz, -30dBFS) を生成して非同期再生"""
+        self._mic_log("[夜間テスト] 極小音量テストトーンを再生中...")
+        script = """
+import numpy as np
+sr = 44100
+t = np.linspace(0, 3, int(sr * 3), False)
+tone = 0.03 * np.sin(2 * np.pi * 1000 * t)
+import subprocess
+raw = (tone * 32767).astype(np.int16).tobytes()
+p = subprocess.Popen(['pw-play', '--rate=44100', '--channels=1', '--format=s16', '-'], stdin=subprocess.PIPE)
+p.communicate(input=raw)
+"""
+        try:
+            subprocess.Popen([sys.executable, "-c", script])
+        except Exception as e:
+            self._mic_log(f"テスト音再生エラー: {e}")

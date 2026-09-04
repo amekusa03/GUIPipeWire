@@ -133,13 +133,23 @@ class PipeWireConfigManager:
 
     def reset_custom_configs(self):
         """
-        GUIPipeWireで生成した設定ファイル（またはバックアップ）をクリーンアップし、システムデフォルトにリセットします。
+        GUIPipeWireで生成した全ての設定ファイル（クロック、リサンプル、5.1chアップミックス、仮想マイクDSP等）をクリーンアップし、システムデフォルトにリセットします。
         """
+        target_files = [
+            self.clock_conf_file,
+            self.resample_conf_file,
+            self.config_dir / "pipewire-pulse.conf.d" / "20-upmix.conf",
+            self.config_dir / "client.conf.d" / "20-upmix.conf",
+            self.config_dir / "pipewire.conf.d" / "99-input-dsp.conf",
+        ]
         removed = []
-        for file in [self.clock_conf_file, self.resample_conf_file]:
+        for file in target_files:
             if file.exists():
-                file.unlink()
-                removed.append(str(file))
+                try:
+                    file.unlink()
+                    removed.append(str(file))
+                except OSError:
+                    pass
         return removed
 
     def _parse_spa_context_properties(self, content):

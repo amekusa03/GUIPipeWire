@@ -1,210 +1,122 @@
-# GUIPipeWire
+# GUIPipeWire 🎵
 
-> **PipeWire の設定を、コマンドなしで。**
-
-PipeWire のサンプリングレート、バッファサイズ（Quantum）、リサンプル品質、リアルタイム再生状態をグラフィカルに設定・監視できる PyQt5 ベースの GUI ツールです。
+**GUIPipeWire** は、Linux の次世代オーディオサーバー **PipeWire** の各種設定（クロック・サンプリングレート・リサンプル品質・5.1chアップミックス・マイクAGC/ノイズ抑制）を視覚的にカスタマイズ・リアルタイム監視できる、モダンで高機能な PyQt5 製 GUI アプリケーションです。
 
 ![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat&logo=python&logoColor=white)
-![PyQt5](https://img.shields.io/badge/PyQt5-GUI-41CD52?style=flat&logo=qt&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-yellow?style=flat)
+![PyQt5](https://img.shields.io/badge/GUI-PyQt5-41CD52?style=flat&logo=qt&logoColor=white)
+![PipeWire](https://img.shields.io/badge/Audio-PipeWire-00ADD8?style=flat)
+![Theme](https://img.shields.io/badge/Theme-Catppuccin_Mocha-89b4fa?style=flat)
+![License](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)
 
 ---
 
-## 💡 PipeWire って何？ / このツールはなぜ必要？
+## ✨ 主な機能
 
-**PipeWire** は、現代の Linux における標準のオーディオ・ビデオサーバーです。
-Ubuntu 22.04 以降、Fedora、Arch Linux など多くのディストリビューションで標準採用されており、音楽・動画・ゲーム・配信など、あらゆる音声処理の中心に位置しています。
+### 1. ⚡ ワンクリック・プリセット機能
+- 📻 **標準バランス**: 48 kHz, Quantum 1024 (一般利用推奨)
+- 🎵 **ハイレゾオーディオ**: 〜192/384 kHz, 品質 14 (高音質音楽鑑賞)
+- ⚡ **低遅延 DTM / ゲーミング**: 48/96 kHz, Quantum 128 (録音・ゲーム・配信)
 
-PipeWire の設定は本来 `~/.config/pipewire/` 配下のテキストファイルを手で書き換える必要があり、初心者には敷居が高い作業でした。  
-**GUIPipeWire** はその作業を GUI から直感的に行えるようにするツールです。
+### 2. 🔊 5.1ch アップミックス & 🎯 音響自動キャリブレーション
+スクロール不要な **左右2カラム構成** で、空間音響と音量バランスを1画面で直感的に調整できます。
 
-```
-こんな時に役立ちます:
-
-🔊 音が途切れる・カクつく         → バッファサイズ (Quantum) を増やす
-🎵 ハイレゾ音源を正しく再生したい  → 許可サンプリングレートを拡張する
-🎛️ DTM・録音の遅延を減らしたい   → Quantum を 128 等に下げる
-🐛 音声周りのトラブルを調べたい    → pw-top でリアルタイム状態を確認する
-```
-
----
-
-## 🌟 主な機能
-
-### 1. ⏱️ クロック & サンプリングレート設定
-
-| 設定項目 | 概要 | 推奨値 |
-|---------|------|-------|
-| **デフォルト動作周波数** | 音声処理の基本周波数 | **48000 Hz (48 kHz)** ★ |
-| **許可サンプリングレート** | 音源の周波数に合わせて自動追従する周波数の範囲 | 44100, 48000 (標準) |
-
-> 🔰 **初心者向け補足**: 「サンプリングレート」とは「1秒間に音声データを何回サンプリングするか」の値です。  
-> 48 kHz が現代の標準で、ゲーム・動画・配信のほぼすべてがこの値を使用しています。  
-> 迷ったら **48000 Hz** を選べばまず問題ありません。
-
-### 2. 🎛️ バッファサイズ (Quantum) & リサンプル設定
-
-| 設定項目 | 値の目安 | 推奨場面 |
-|---------|---------|---------|
-| **Quantum (バッファ)** | 1024 (21.3 ms) | 一般利用・安定性重視 ★ |
-| | 512 (10.7 ms) | バランス重視 |
-| | 128 (2.7 ms) | DTM・録音・超低遅延 |
-| **リサンプル品質** | 4 (デフォルト) | 一般利用 |
-| | 14 (最高) | ハイレゾ・高音質重視 |
-
-> 🔰 **初心者向け補足**: 「Quantum (バッファ)」は「音声データをまとめて処理するブロックの大きさ」です。  
-> 大きいほど安定しますが遅延が増え、小さいほど遅延は減りますが CPU への負荷が増えます。  
-> 音が途切れる場合は大きくし、DTM・録音の遅延が気になる場合は小さくしてみてください。
-
-### 3. 🔊 5.1ch サラウンド・アップミックス
-
-2ch ステレオ音源を 5.1ch サラウンドへアップミックスする各種設定を細かく調整・切り替え可能です:
-
-- **プリセット**: 標準 (PSD) / 映画・サラウンド重視 / 音楽・自然な広がり / シンプル (Simple方式) / カスタム
-- **詳細パラメータ**:
-  - アップミックス方式 (`psd` / `simple` / `none`)
+- **空間音響アップミックス (左カラム)**:
+  - 方式 (`psd` / `simple` / `none`)
   - サブウーファー LFE カットオフ周波数 (40Hz 〜 200Hz)
   - リアスピーカー ディレイ (0.0ms 〜 50.0ms)
   - センター FC カットオフ周波数 (0Hz 〜 20000Hz)
   - ステレオ広がり感 (`stereo-widen`: 0.00 〜 1.00)
-- **6ch スピーカーテスト (`speaker-test`) 内蔵**
+  - 6ch スピーカーテスト (`speaker-test`) 内蔵
+- **スピーカー音量バランス & マイク自動測定 (右カラム)**:
+  - **起動時自動同期**: 現在システムで設定されている 5.1ch 各チャンネル音量を自動取得してスライダーに即時反映。
+  - **マイク自動キャリブレーション**: 各チャンネルから順次テスト音を鳴らし、マイク測定により全スピーカーの音量をリスニング位置で自動均一化。
+  - **夜間・静音測定**: 爆音を出さずに小音量（15%）テスト音と環境ノイズ事前測定で安全・高精度に測定。
+  - **6ch 個別音量スライダー**: 測定値の確認、手動微調整、100%リセット、PipeWireへの即時適用。
 
-### 4. ⚡ ワンクリック・プリセット機能
+### 3. 🎙️ マイク & AGC (自動音量均一化) / ノイズ抑制
+スクロール不要な **左右2カラム構成** で、配信・通話・ゲームに最適なクリアなマイク入力を実現します。
 
-手動設定が不要な用途別プリセットを用意しています:
+- **マイク入力 & モニター (左カラム)**:
+  - リアルタイム・レベルメーター (RMS / Peak dBFS)
+  - 音割れ / 適正 / 小声 の自動判定バッジ
+  - マイク手動音量 (Gain) スライダー
+- **PipeWire WebRTC DSP 仮想マイク (左カラム)**:
+  - OSネイティブの超低遅延 WebRTC DSP 仮想マイクを作成・有効化。
+  - 自動ゲイン調整 (AGC)、AIノイズ抑制、ハイパスフィルター、音声検知 (VAD) をワンクリック適用。
+  - Discord、OBS、ブラウザ等の入力に「マイク (AGC・ノイズ抑制適用済み)」として指定可能。
+- **動的ゲイン自動追従 (右カラム)**:
+  - 目標音量（Target Level）に合わせて Python がマイクゲインをリアルタイムに自動微調整。
+  - 環境ノイズを拾わない無音閾値（Noise Floor）設定。
+  - 動作ログエリア（コンパクト表示）。
+- **夜間・静音テスト支援モード (右カラム)**:
+  - 囁き声の増幅テストや、極小音量テストトーン（-30dBFS）の注入シミュレーション。
 
-| プリセット | 用途 | 主な設定 |
-|-----------|------|---------|
-| 📻 **標準バランス** | 一般利用・迷ったらこれ | 48 kHz, Quantum 1024 |
-| 🎵 **ハイレゾオーディオ** | 高音質音楽鑑賞 | 〜384 kHz 対応, リサンプル品質 14 |
-| ⚡ **低遅延 DTM / ゲーミング** | 録音・配信・ゲーム | 48/96 kHz, Quantum 128 |
+### 4. ⏱️ クロック & サンプリングレート設定
+- **標準動作周波数 (`default.clock.rate`)**: 44.1 kHz 〜 384 kHz から選択（デフォルト: 48 kHz 推奨）。
+- **許可サンプリングレート (`default.clock.allowed-rates`)**: 音源に合わせて自動切り替えを許可する周波数をチェックボックスで一括指定。
+- **バッファサイズ & レイテンシ (`Quantum`)**:
+  - デフォルト Quantum (標準推奨: 1024 / 低遅延: 512 / 超低遅延 DTM: 128)
+  - 最小・最大 Quantum の範囲指定。
 
-### 4. 📊 リアルタイム再生監視 & ログ
+### 5. 🎛️ クライアント・リサンプル設定
+- **リサンプル品質 (`resample.quality`)**: 0 (超軽量) 〜 14 (マスタリング級最高音質) をスライダーで調整。
+- **チャンネルミックス制御**: リサンプル無効化、音量正規化、基本アップミックスの切り替え。
 
-- **`pw-top` 連携**: 現在オーディオを再生・録音しているアプリ（Rhythmbox, Firefox, Spotify 等）の状態を表示。
-  ```
-  S   ID  QUANT   RATE  WAIT  BUSY  ERR  FORMAT         NAME
-  R   83   2048  44100  69us  22us    0  S32LE 2 44100  alsa_output...
-  R  127   3969  44100  24us  37us    0  S16LE 2 44100  Rhythmbox
-  ```
-- **`pw-metadata settings`**: 現在システムに適用されている動的設定をリアルタイム確認。
-- **`journalctl` ログ**: PipeWire サービスのシステムログを確認。
+### 6. 📊 リアルタイム監視 & ログ
+- `pw-top` による再生・録音ストリームのリアルタイム監視。
+- `pw-metadata settings` による現在の動作設定確認。
+- `journalctl` による PipeWire システムログのリアルタイム表示。
 
-### 5. 📝 設定ファイル直接編集
+### 7. 📝 設定ファイル直接編集
+- 生成されたドロップイン設定ファイルを内蔵エディタで直接確認・編集・保存可能。
 
-生成した設定ファイルをアプリ内テキストエディタで直接閲覧・編集・保存することもできます。
+### 8. 🔄 全設定「デフォルトにリセット」機能
+- 画面下部のボタン1つで、クロック・リサンプル・5.1chアップミックス・マイク仮想マイク・チャンネル音量・動的ゲインの**全設定を一括でシステム初期状態へ完全復元**。
 
 ---
 
-## 🛠️ 動作要件
+## 🛠️ 動作要件 & インストール
 
-- **OS**: Linux (PipeWire が動作しているディストリビューション)
+### 必要環境
+- **OS**: Linux (PipeWire が動作している環境)
 - **Python**: 3.8 以上
-- **必要なコマンド**: `pw-top`, `pw-metadata`, `systemctl`（通常 PipeWire に同梱）
 
-### Python の確認
-
-```bash
-python3 --version   # 3.8 以上であれば OK
-```
-
-### PyQt5 のインストール
+### 依存パッケージのインストール
 
 #### Ubuntu / Debian / Pop!_OS
 ```bash
 sudo apt update
-sudo apt install python3-pyqt5 pipewire-bin
+sudo apt install python3-pyqt5 python3-numpy python3-pulsectl alsa-utils pipewire-bin
 ```
 
 #### Arch Linux / Manjaro
 ```bash
-sudo pacman -S python-pyqt5 pipewire
+sudo pacman -S python-pyqt5 python-numpy alsa-utils pipewire
+pip install pulsectl  # AUR 経由でも可
 ```
 
 #### Fedora
 ```bash
-sudo dnf install python3-qt5 pipewire-utils
-```
-
-#### pip を使う場合（仮想環境不要）
-```bash
-pip install PyQt5
+sudo dnf install python3-qt5 python3-numpy alsa-utils pipewire-utils
+pip install pulsectl
 ```
 
 ---
 
-## 🚀 インストール & 起動
-
-### ステップ 1: リポジトリを取得
+## 🚀 起動方法
 
 ```bash
-git clone https://github.com/yourusername/GUIPipeWire.git
-cd GUIPipeWire
-```
-
-### ステップ 2: PyQt5 をインストール（まだの場合）
-
-```bash
-# Ubuntu / Debian の場合
-sudo apt install python3-pyqt5
-```
-
-### ステップ 3: 起動
-
-```bash
+# 実行スクリプトから起動
 ./run.sh
-```
 
-または:
-
-```bash
+# または直接起動
 python3 main.py
 ```
 
-### (オプション) デスクトップショートカットを追加
-
+### デスクトップメニューへの追加 (オプション)
 ```bash
 cp gui-pipewire.desktop ~/.local/share/applications/
 ```
-
-アプリケーションランチャーから「GUIPipeWire」で起動できるようになります。
-
----
-
-## 🔧 使い方
-
-### 基本的な設定の流れ
-
-```
-1. アプリを起動する
-2. 「⏱️ クロック・サンプリングレート」タブで設定値を選択
-   (迷ったら「⚡ プリセット」タブから用途に合ったものをクリック)
-3. 画面下部の「💾 設定を保存して PipeWire を再起動」をクリック
-4. 「📊 リアルタイム監視」タブで設定が反映されたか確認
-```
-
-> ⚠️ **注意**: 設定を保存すると PipeWire が自動的に再起動されます。  
-> 再起動中（1〜2秒程度）は一時的に音声出力が途切れますが、正常な動作です。
-
-### 初期状態に戻したい場合
-
-画面下部の **「デフォルトに戻す (設定ファイルを削除)」** ボタンを押すと、  
-GUIPipeWire が生成した設定ファイルが削除され、PipeWire のシステムデフォルト設定に戻ります。
-
----
-
-## 📁 生成される設定ファイル
-
-GUIPipeWire はシステム本体の設定を変更せず、ユーザー領域のドロップイン設定ファイルのみを操作します。
-
-| ファイル | 内容 |
-|---------|------|
-| `~/.config/pipewire/pipewire.conf.d/10-clock.conf` | クロック・サンプリングレート設定 |
-| `~/.config/pipewire/client.conf.d/10-resample.conf` | リサンプル・チャンネルミキシング設定 |
-| `~/.config/pipewire/pipewire-pulse.conf.d/20-upmix.conf` | 5.1ch アップミックス設定 (Pulseクライアント用) |
-| `~/.config/pipewire/client.conf.d/20-upmix.conf` | 5.1ch アップミックス設定 (PipeWireネイティブ用) |
-
-保存時には自動的にバックアップ (`.bak`) が作成されます。
 
 ---
 
@@ -212,39 +124,65 @@ GUIPipeWire はシステム本体の設定を変更せず、ユーザー領域�
 
 ```text
 GUIPipeWire/
-├── main.py              # アプリケーションのエントリーポイント
-├── gui_window.py        # PyQt5 メインウィンドウ・UIレイアウト・各種タブ
-├── pipewire_config.py   # 設定ファイル (~/.config/pipewire/) の読み書き・パース
-├── pipewire_service.py  # PipeWire サービス制御 (systemctl, pw-top, pw-metadata, journalctl)
-├── gui-pipewire.desktop # デスクトップ環境用アプリケーションショートカット
-├── run.sh               # 起動用シェルスクリプト
-└── README.md            # ドキュメント (本書)
+├── main.py                 # アプリケーション起動エントリーポイント
+├── gui_window.py           # メインウィンドウ・UIレイアウト・各種タブ実装
+├── pipewire_config.py      # 設定ファイル (~/.config/pipewire/) の読込・生成・リセット
+├── pipewire_service.py     # PipeWire サービス制御 (systemctl, pw-top, journalctl)
+├── pipewire_calibrator.py  # 5.1ch 音響自動キャリブレーション & 音量取得/適用
+├── pipewire_agc.py         # マイク入力監視・WebRTC DSP 仮想マイク・動的ゲイン追従
+├── gui-pipewire.desktop    # デスクトップ環境用ショートカット定義
+├── run.sh                  # 起動用シェルスクリプト
+└── README.md               # ドキュメント (本書)
 ```
+
+---
+
+## 📁 生成される設定ファイル
+
+GUIPipeWire はシステムのルート領域を変更せず、ユーザー領域のドロップイン設定ファイルのみを操作します。
+
+| 設定ファイル | 内容 |
+|-------------|------|
+| `~/.config/pipewire/pipewire.conf.d/10-clock.conf` | クロックレート・サンプリングレート・Quantum 設定 |
+| `~/.config/pipewire/client.conf.d/10-resample.conf` | クライアント・リサンプル品質・ミキシング設定 |
+| `~/.config/pipewire/pipewire-pulse.conf.d/20-upmix.conf` | 5.1ch アップミックス設定 (PulseAudio クライアント用) |
+| `~/.config/pipewire/client.conf.d/20-upmix.conf` | 5.1ch アップミックス設定 (PipeWire ネイティブ用) |
+| `~/.config/pipewire/pipewire.conf.d/99-input-dsp.conf` | WebRTC DSP マイク AGC / ノイズ抑制 仮想マイク設定 |
 
 ---
 
 ## ❓ よくある質問 (FAQ)
 
 **Q. 設定を保存後に音が全く出なくなった**  
-A. 「デフォルトに戻す」ボタンを押してリセットした後、PipeWire を再起動してください。  
+A. 画面下部の「デフォルトにリセット」ボタンを押してください。全設定が初期化されて PipeWire が再起動されます。それでも復旧しない場合:
 ```bash
 systemctl --user restart pipewire pipewire-pulse
 ```
 
-**Q. `pw-top` が「取得エラー」になる**  
-A. `pw-top` コマンドがインストールされていない可能性があります。  
+**Q. マイク & AGC タブで「pulsectl が見つかりません」エラーが出る**  
+A. `pulsectl` ライブラリをインストールしてください。
+```bash
+pip install pulsectl
+```
+
+**Q. `pw-top` の情報が「取得エラー」になる**  
+A. `pw-top` コマンドが未インストールの可能性があります。
 ```bash
 # Ubuntu の場合
 sudo apt install pipewire-bin
-
-# Arch の場合
-sudo pacman -S pipewire
 ```
 
-**Q. `./run.sh` の実行時に「Permission denied」と表示される**  
+**Q. `./run.sh` で「Permission denied」と表示される**  
 A. 実行権限を付与してください。
 ```bash
 chmod +x run.sh
+```
+
+**Q. 5.1ch アップミックスを有効にしたが音が出ない**  
+A. `speaker-test` をインストールして 6ch テストを試してください。
+```bash
+# Ubuntu の場合
+sudo apt install alsa-utils
 ```
 
 ---
