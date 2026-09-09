@@ -2,7 +2,7 @@
 import sys
 import os
 
-# Wayland 環境での無害な requestActivate 警告ログを抑制
+# Suppress harmless requestActivate warning logs in Wayland environment
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland=false")
 
 from PyQt5.QtWidgets import QApplication

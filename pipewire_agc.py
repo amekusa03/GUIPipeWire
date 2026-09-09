@@ -1,33 +1,59 @@
 import os
 import re
 import math
-import shutil
 import struct
 import subprocess
 from pathlib import Path
 from PyQt5.QtCore import QThread, pyqtSignal
 
 class PipeWireAGCManager:
-    """PipeWire の WebRTC DSP (AGC / ノイズ抑制 / エコーキャンセル) 設定を管理するクラス"""
+    """
+    Manager for configuring PipeWire WebRTC DSP echo-cancel / AGC / noise suppression module
+    and generating user configuration files (~/.config/pipewire/pipewire.conf.d/99-input-dsp.conf).
+    """
 
     def __init__(self):
-        self.config_dir = Path.home() / ".config" / "pipewire"
-        self.pw_conf_d = self.config_dir / "pipewire.conf.d"
-        self.agc_conf_file = self.pw_conf_d / "30-webrtc-agc.conf"
-        self._ensure_directories()
+        self.config_dir = Path(os.path.expanduser("~/.config/pipewire/pipewire.conf.d"))
+        self.agc_conf_file = self.config_dir / "99-input-dsp.conf"
 
     def _ensure_directories(self):
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        self.pw_conf_d.mkdir(parents=True, exist_ok=True)
 
-    def is_hardware_agc_enabled(self):
-        """PipeWire ネイティブの WebRTC AGC 設定が存在するか確認"""
+    def is_hardware_agc_enabled(self) -> bool:
+        """Return True if WebRTC DSP virtual mic config file exists."""
         return self.agc_conf_file.exists()
+
+    def get_current_dsp_settings(self) -> dict:
+        """Parse current WebRTC DSP configuration."""
+        settings = {
+            "enabled": False,
+            "gain_control": True,
+            "noise_suppression": True,
+            "high_pass": True,
+            "voice_detection": True
+        }
+        if not self.agc_conf_file.exists():
+            return settings
+
+        settings["enabled"] = True
+        try:
+            content = self.agc_conf_file.read_text(encoding="utf-8")
+            if "webrtc.gain_control = false" in content:
+                settings["gain_control"] = False
+            if "webrtc.noise_suppression = false" in content:
+                settings["noise_suppression"] = False
+            if "webrtc.high_pass_filter = false" in content:
+                settings["high_pass"] = False
+            if "webrtc.voice_detection = false" in content:
+                settings["voice_detection"] = False
+        except Exception:
+            pass
+        return settings
 
     def enable_hardware_agc(self, gain_control=True, noise_suppression=True, high_pass=True, voice_detection=True):
         """
-        PipeWire の libpipewire-module-echo-cancel (WebRTC AEC) を有効化し、
-        自動ゲイン調整 & ノイズ抑制付きの仮想マイクを作成する設定を保存。
+        Create PipeWire WebRTC DSP echo-cancel module drop-in config
+        to instantiate an OS-level virtual microphone with DSP effects.
         """
         self._ensure_directories()
 
@@ -38,10 +64,10 @@ class PipeWireAGCManager:
             "        name = libpipewire-module-echo-cancel",
             "        args = {",
             '            library.name = "aec/libspa-aec-webrtc"',
-            '            node.description = "GUIPipeWire 仮想マイク (AGC・ノイズ抑制)"',
+            '            node.description = "GUIPipeWire Virtual Microphone (AGC & Noise Suppression)"',
             "            source.props = {",
             '                node.name = "GUIPipeWire_AGC_Source"',
-            '                node.description = "マイク (AGC・ノイズ抑制適用済み)"',
+            '                node.description = "Microphone (with AGC & Noise Suppression)"',
             "            }",
             "            aec.args = {",
             f"                webrtc.gain_control = {'true' if gain_control else 'false'}",
@@ -60,7 +86,7 @@ class PipeWireAGCManager:
         return str(self.agc_conf_file)
 
     def disable_hardware_agc(self):
-        """WebRTC AGC 設定ファイルを削除"""
+        """Delete WebRTC AGC drop-in configuration file."""
         if self.agc_conf_file.exists():
             self.agc_conf_file.unlink()
             return True
@@ -69,25 +95,25 @@ class PipeWireAGCManager:
 
 class MicrophoneMonitorThread(QThread):
     """
-    マイクの入力レベル (RMS / Peak dBFS) をリアルタイムに監視し、
-    必要に応じて Python 側で自動音量均一化 (Software AGC) を行うワーカースレッド。
+    Worker thread that monitors microphone input levels (RMS / Peak dBFS) in real time
+    and performs dynamic gain auto-tracking (Software AGC) in Python.
     """
     level_updated = pyqtSignal(float, float, float, bool)  # rms_db, peak_db, current_vol, is_clipping
-    agc_action = pyqtSignal(str)  # ログ/通知メッセージ
+    agc_action = pyqtSignal(str)  # Log / notification message
 
     def __init__(self, source_name=None, parent=None):
         super().__init__(parent)
         self.source_name = source_name
         self.running = False
         
-        # Software AGC 設定パラメータ
+        # Software AGC parameters
         self.soft_agc_enabled = False
-        self.target_db = -18.0          # 目標音量 (dBFS)
-        self.noise_floor_db = -48.0     # 無音・ノイズ判定閾値 (これ以下はゲインを上げない)
-        self.attack_rate = 0.15         # 大音量時の減衰速度 (速め)
-        self.release_rate = 0.04        # 小音量時の増幅速度 (ゆっくり)
-        self.min_gain = 0.2             # 最小音量 (20%)
-        self.max_gain = 1.5             # 最大音量 (150%)
+        self.target_db = -18.0          # Target volume (dBFS)
+        self.noise_floor_db = -48.0     # Noise floor threshold (dBFS)
+        self.attack_rate = 0.15         # Fast reduction rate on loud signals
+        self.release_rate = 0.04        # Gentle amplification rate on quiet signals
+        self.min_gain = 0.2             # Minimum gain (20%)
+        self.max_gain = 1.5             # Maximum gain (150%)
         
         self.process = None
 
@@ -107,9 +133,9 @@ class MicrophoneMonitorThread(QThread):
         try:
             pulse = pulsectl.Pulse('guipipewire-monitor')
         except Exception as e:
-            self.agc_action.emit(f"PulseAudio/PipeWire 接続エラー: {e}")
+            self.agc_action.emit(f"PulseAudio/PipeWire connection error: {e}")
 
-        # pw-record で 16bit 16kHz mono の生音声をパイプ読み込み (CPU負荷極小)
+        # Stream raw 16bit 16kHz mono audio via pw-record (minimal CPU overhead)
         cmd = [
             "pw-record",
             "--channels=1",
@@ -128,7 +154,7 @@ class MicrophoneMonitorThread(QThread):
                 bufsize=1024 * 4
             )
 
-            # 16000Hz * 1ch * 2bytes/sample * 0.05秒 = 1600 bytes (50ms ごとに集計)
+            # 16000Hz * 1ch * 2bytes/sample * 0.05s = 1600 bytes (50ms chunks)
             chunk_size = 1600
             
             while self.running and self.process.poll() is None:
@@ -136,22 +162,21 @@ class MicrophoneMonitorThread(QThread):
                 if not raw_data or len(raw_data) < 2:
                     continue
 
-                # 16bit リニアPCM をデコード (-32768 〜 32767)
                 count = len(raw_data) // 2
                 samples = struct.unpack(f"<{count}h", raw_data[:count*2])
                 
-                # Peak & RMS 計算
+                # Peak & RMS calculation
                 peak = max(abs(s) for s in samples)
                 sum_sq = sum(s * s for s in samples)
                 rms = math.sqrt(sum_sq / count)
 
-                # dBFS 変換 (0dBFS = 32767)
+                # Convert to dBFS (0 dBFS = 32767)
                 peak_db = 20 * math.log10(max(1, peak) / 32767.0)
                 rms_db = 20 * math.log10(max(1, rms) / 32767.0)
                 
                 is_clipping = peak >= 32000
 
-                # 現在のマイク音量を取得
+                # Get current mic volume
                 current_vol = 1.0
                 source_obj = None
                 if pulse:
@@ -166,35 +191,33 @@ class MicrophoneMonitorThread(QThread):
                     except Exception:
                         pass
 
-                # Software AGC (自動ゲイン調整ロジック)
+                # Software AGC (dynamic gain tracking)
                 if self.soft_agc_enabled and pulse and source_obj:
-                    # 1. 音割れ/クリッピング緊急回避
+                    # 1. Emergency clipping avoidance
                     if is_clipping or peak_db > -2.0:
                         new_vol = max(self.min_gain, current_vol * 0.8)
                         pulse.volume_set_all_chans(source_obj, new_vol)
-                        self.agc_action.emit(f"[AGC] 音割れ検知: 音量を {int(new_vol*100)}% に抑制")
+                        self.agc_action.emit(f"[AGC] Clipping detected: Reduced gain to {int(new_vol*100)}%")
                     
-                    # 2. 通常の発声時 (無音フロアより大きく、目標音量と乖離がある場合)
+                    # 2. Regular voice activity (above noise floor and deviating from target)
                     elif rms_db > self.noise_floor_db:
                         diff_db = self.target_db - rms_db
-                        if abs(diff_db) > 2.5: # 2.5dB 以上のズレで調整開始
+                        if abs(diff_db) > 2.5:
                             if diff_db > 0:
-                                # 音が小さい → ゆっくり上げる
                                 step = (diff_db / 20.0) * self.release_rate
                                 new_vol = min(self.max_gain, current_vol + step)
                             else:
-                                # 音が大きい → やや素早く下げる
                                 step = (abs(diff_db) / 20.0) * self.attack_rate
                                 new_vol = max(self.min_gain, current_vol - step)
                             
                             if abs(new_vol - current_vol) > 0.01:
                                 pulse.volume_set_all_chans(source_obj, new_vol)
 
-                # UI にシグナル送信
+                # Emit signal to UI
                 self.level_updated.emit(rms_db, peak_db, current_vol, is_clipping)
 
         except Exception as e:
-            self.agc_action.emit(f"マイク監視エラー: {e}")
+            self.agc_action.emit(f"Microphone monitor error: {e}")
         finally:
             if self.process:
                 try:

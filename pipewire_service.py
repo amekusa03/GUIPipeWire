@@ -2,12 +2,12 @@ import subprocess
 import re
 
 class PipeWireServiceManager:
-    """PipeWire systemd サービス制御、メタデータ取得、ログ閲覧を管理するクラス"""
+    """Class to manage PipeWire systemd user services, metadata querying, and log inspection."""
 
     @staticmethod
     def restart_pipewire():
         """
-        systemctl --user restart pipewire pipewire-pulse (必要に応じて) を実行
+        Execute systemctl --user restart pipewire (and pipewire-pulse if active).
         """
         results = []
         # pipewire
@@ -15,7 +15,7 @@ class PipeWireServiceManager:
         p1 = subprocess.run(cmd1, capture_output=True, text=True)
         results.append(("pipewire", p1.returncode == 0, p1.stdout or p1.stderr))
 
-        # pipewire-pulse が存在・有効な場合は再起動
+        # pipewire-pulse
         cmd2 = ["systemctl", "--user", "restart", "pipewire-pulse"]
         p2 = subprocess.run(cmd2, capture_output=True, text=True)
         if p2.returncode == 0:
@@ -26,7 +26,7 @@ class PipeWireServiceManager:
     @staticmethod
     def get_service_status():
         """
-        systemctl --user status pipewire の出力を取得
+        Get output of systemctl --user status pipewire
         """
         try:
             p = subprocess.run(
@@ -43,14 +43,14 @@ class PipeWireServiceManager:
     @staticmethod
     def get_live_metadata():
         """
-        pw-metadata -n settings から現在のリアルタイム設定情報を取得
+        Get active runtime metadata via pw-metadata -n settings
         """
         info = {
-            "clock.rate": "不明",
-            "clock.allowed-rates": "不明",
-            "clock.quantum": "不明",
-            "clock.min-quantum": "不明",
-            "clock.max-quantum": "不明",
+            "clock.rate": "Unknown",
+            "clock.allowed-rates": "Unknown",
+            "clock.quantum": "Unknown",
+            "clock.min-quantum": "Unknown",
+            "clock.max-quantum": "Unknown",
             "raw": ""
         }
         try:
@@ -86,14 +86,14 @@ class PipeWireServiceManager:
                         info["clock.max-quantum"] = m.group(1)
 
         except Exception as e:
-            info["raw"] = f"取得エラー: {e}"
+            info["raw"] = f"Error retrieving settings: {e}"
 
         return info
 
     @staticmethod
     def get_recent_logs(lines=50):
         """
-        journalctl --user -u pipewire の最新ログを取得
+        Get recent logs from journalctl --user -u pipewire
         """
         try:
             p = subprocess.run(
@@ -104,13 +104,12 @@ class PipeWireServiceManager:
             )
             return p.stdout or p.stderr
         except Exception as e:
-            return f"ログ取得エラー: {e}"
+            return f"Error retrieving logs: {e}"
 
     @staticmethod
     def get_pw_top_snapshot():
         """
-        pw-top -b -n 2 を実行して最新のリアルタイムグラフ・ノード再生状態を取得
-        (1回目サンプルは初期化直後のため0/---となり、2回目サンプルで正確なリアルタイム数値が得られる)
+        Run pw-top -b -n 2 to get real-time stream status and node playback statistics.
         """
         try:
             p = subprocess.run(
@@ -125,4 +124,4 @@ class PipeWireServiceManager:
                 return ("S   ID  QUANT" + blocks[-1]).strip()
             return raw.strip() or p.stderr
         except Exception as e:
-            return f"pw-top 取得エラー: {e}"
+            return f"Error running pw-top: {e}"

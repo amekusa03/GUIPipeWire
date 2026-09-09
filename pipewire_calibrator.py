@@ -7,37 +7,37 @@ import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 CHANNEL_NAMES = [
-    ("front-left", "フロント左 (FL)"),
-    ("front-right", "フロント右 (FR)"),
-    ("front-center", "センター (FC)"),
-    ("lfe", "サブウーファー (LFE)"),
-    ("rear-left", "リア左 (RL)"),
-    ("rear-right", "リア右 (RR)")
+    ("front-left", "Front Left (FL)"),
+    ("front-right", "Front Right (FR)"),
+    ("front-center", "Center (FC)"),
+    ("lfe", "Subwoofer (LFE)"),
+    ("rear-left", "Rear Left (RL)"),
+    ("rear-right", "Rear Right (RR)")
 ]
 
 def generate_channel_test_tone(channel_idx, num_channels=6, sample_rate=48000, duration_sec=0.8, volume=0.15):
     """
-    指定したチャンネルのみにテストトーン（5.1ch 16bit PCM）を生成。
-    LFEチャンネルは70Hz、通常チャンネルは1000Hz。フェードイン・アウト付き。
+    Generate a test tone (5.1ch 16-bit PCM) for a specific channel.
+    LFE channel uses 70Hz sine wave; other channels use 1000Hz. Includes 50ms fade in/out.
     """
     total_samples = int(sample_rate * duration_sec)
     t = np.linspace(0, duration_sec, total_samples, False)
 
-    # 周波数設定 (LFE は 70Hz、通常は 1000Hz)
+    # Frequency: 70Hz for LFE, 1000Hz for regular channels
     freq = 70.0 if channel_idx == 3 else 1000.0
     tone = volume * np.sin(2 * np.pi * freq * t)
 
-    # 50ms フェードイン & フェードアウト
+    # 50ms fade-in & fade-out
     fade_len = int(sample_rate * 0.05)
     fade_in = np.linspace(0, 1, fade_len)
     fade_out = np.linspace(1, 0, fade_len)
     tone[:fade_len] *= fade_in
     tone[-fade_len:] *= fade_out
 
-    # 6チャンネル配列の作成 (全て0で初期化)
+    # 6-channel array initialized to 0
     multi_ch = np.zeros((total_samples, num_channels), dtype=np.int16)
     
-    # 対象チャンネルのみに配置 (-32767 〜 32767)
+    # Place tone into the target channel (-32767 to 32767)
     multi_ch[:, channel_idx] = (tone * 32767).astype(np.int16)
 
     return multi_ch.tobytes()
@@ -45,50 +45,49 @@ def generate_channel_test_tone(channel_idx, num_channels=6, sample_rate=48000, d
 
 class CalibrationWorkerThread(QThread):
     """
-    5.1ch 各スピーカーから順次音を出してマイクで音量を測定し、
-    全チャンネル均一化のための補正ゲインを自動計算するスレッド。
+    Worker thread that sequentially plays test tones across 5.1ch speakers,
+    records microphone input, and calculates optimal channel balance gain multipliers.
     """
-    progress_updated = pyqtSignal(int, str, str)  # step_idx (0..6), ch_name, status_msg
-    step_result = pyqtSignal(int, float)          # ch_idx (0..5), measured_db
-    finished_calibration = pyqtSignal(dict)       # 全結果データ dict
-    error_occurred = pyqtSignal(str)              # エラーメッセージ
+    progress_updated = pyqtSignal(int, str, str)  # step_idx (0..7), ch_name, status_msg
+    step_result = pyqtSignal(int, float)          # ch_idx, measured_db
+    finished_calibration = pyqtSignal(dict)       # result_dict
+    error_occurred = pyqtSignal(str)              # error_msg
 
-    def __init__(self, sink_name=None, mic_source_name=None, test_volume=0.15, parent=None):
-        super().__init__(parent)
+    def __init__(self, sink_name=None, mic_source_name=None, test_volume=0.15):
+        super().__init__()
         self.sink_name = sink_name
         self.mic_source_name = mic_source_name
-        self.test_volume = test_volume  # 0.05 〜 0.5 (夜間は 0.10 〜 0.15 推奨)
-        self.running = False
+        self.test_volume = test_volume
+        self.running = True
 
     def stop(self):
         self.running = False
 
     def run(self):
-        self.running = True
-        sample_rate = 48000
-        duration = 0.8
-        
         try:
+            sample_rate = 48000
+            duration = 0.8  # Test tone duration per channel
+
             # ------------------------------------------------------------
-            # Step 0: 暗騒音（部屋の環境ノイズ）の測定 (1秒間)
+            # Step 0: Measure ambient noise baseline (0.8s)
             # ------------------------------------------------------------
-            self.progress_updated.emit(0, "環境ノイズ", "部屋の暗騒音（環境音）を測定中...")
-            noise_floor_db = self._record_mic_rms(duration_sec=0.8, sample_rate=sample_rate)
+            self.progress_updated.emit(0, "Ambient Noise", "Measuring background noise baseline (0.8s)...")
+            noise_floor_db = self._record_mic_rms(duration_sec=duration, sample_rate=16000)
             if not self.running:
                 return
 
             measured_dbs = []
 
             # ------------------------------------------------------------
-            # Step 1〜6: 各チャンネルの順次テスト & マイク計測
+            # Step 1-6: Sequentially test FL, FR, FC, LFE, RL, RR
             # ------------------------------------------------------------
             for ch_idx, (ch_id, ch_label) in enumerate(CHANNEL_NAMES):
                 if not self.running:
                     return
 
-                self.progress_updated.emit(ch_idx + 1, ch_label, f"{ch_label} を再生＆マイク測定中...")
+                self.progress_updated.emit(ch_idx + 1, ch_label, f"Testing {ch_label}... (0.8s)")
 
-                # テスト音 PCM データ生成
+                # Generate 6ch PCM test audio
                 raw_audio = generate_channel_test_tone(
                     channel_idx=ch_idx,
                     num_channels=6,
@@ -97,7 +96,7 @@ class CalibrationWorkerThread(QThread):
                     volume=self.test_volume
                 )
 
-                # 再生と録音を並行実行
+                # Play sound and record microphone RMS simultaneously
                 measured_db = self._play_and_record(raw_audio, duration_sec=duration, sample_rate=sample_rate)
                 if not self.running:
                     return
@@ -105,31 +104,29 @@ class CalibrationWorkerThread(QThread):
                 measured_dbs.append(measured_db)
                 self.step_result.emit(ch_idx, measured_db)
 
-                # チャンネル間の短い待機 (0.3秒)
+                # Short delay between channels (0.3s)
                 time.sleep(0.3)
 
             # ------------------------------------------------------------
-            # 補正値（キャリブレーションゲイン）の計算
+            # Calculate correction gains
             # ------------------------------------------------------------
-            # フロント左 (FL) を基準、または有効な平均値を基準ターゲットとする
+            # Use Front Left (FL) as reference or mean of valid channels
             valid_dbs = [db for db in measured_dbs if db > -80.0]
             if not valid_dbs:
                 target_db = -30.0
             else:
-                # フロント左をメイン基準（FLが極端に低くなければ）
-                target_db = measured_dbs[0] if measured_dbs[0] > -70.0 else np.mean(valid_dbs)
+                target_db = measured_dbs[0] if measured_dbs[0] > -70.0 else float(np.mean(valid_dbs))
 
             recommended_volumes = []
             gain_diffs_db = []
 
             for db in measured_dbs:
-                # 目標との差分 (dB)
                 diff_db = target_db - db
-                # 補正倍率 (安全のため ±9dB にリミット)
+                # Clamp adjustment within +/- 9dB for safety
                 diff_db_clamped = max(-9.0, min(9.0, diff_db))
                 multiplier = 10.0 ** (diff_db_clamped / 20.0)
                 
-                # 基準100%に対する推奨音量 (0.2〜1.8 = 20%〜180%)
+                # Recommended volume relative to 100% (0.2 to 1.8 = 20% to 180%)
                 rec_vol = max(0.2, min(1.8, multiplier))
                 
                 gain_diffs_db.append(diff_db)
@@ -143,14 +140,14 @@ class CalibrationWorkerThread(QThread):
                 "recommended_volumes": recommended_volumes
             }
 
-            self.progress_updated.emit(7, "完了", "全チャンネルの測定が完了しました！")
+            self.progress_updated.emit(7, "Complete", "All channel measurements completed successfully!")
             self.finished_calibration.emit(result_data)
 
         except Exception as e:
-            self.error_occurred.emit(f"キャリブレーション失敗: {e}")
+            self.error_occurred.emit(f"Calibration failed: {e}")
 
     def _record_mic_rms(self, duration_sec=0.8, sample_rate=16000):
-        """マイクから音声を指定秒数録音して RMS (dBFS) を計算"""
+        """Record microphone audio and compute RMS (dBFS)"""
         cmd = [
             "pw-record",
             "--channels=1",
@@ -179,8 +176,7 @@ class CalibrationWorkerThread(QThread):
         return 20.0 * math.log10(max(1.0, rms) / 32767.0)
 
     def _play_and_record(self, raw_audio, duration_sec=0.8, sample_rate=48000):
-        """テスト音を 6ch 再生しながら、マイク入力を同時に録音して RMS を計算"""
-        # 1. 録音プロセスを先に起動 (16kHz mono)
+        """Play 6ch audio and record mic input simultaneously to compute steady RMS"""
         rec_rate = 16000
         rec_cmd = [
             "pw-record",
@@ -194,7 +190,6 @@ class CalibrationWorkerThread(QThread):
 
         rec_proc = subprocess.Popen(rec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-        # 2. 再生プロセスを起動 (48kHz 6ch)
         play_cmd = [
             "pw-play",
             "--channels=6",
@@ -206,12 +201,9 @@ class CalibrationWorkerThread(QThread):
             play_cmd.extend(["--target", self.sink_name])
 
         play_proc = subprocess.Popen(play_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        
-        # 音声データを流し込んで再生
         play_proc.stdin.write(raw_audio)
         play_proc.stdin.close()
 
-        # 録音データを読み込み (再生時間分)
         total_rec_bytes = int(rec_rate * 2 * duration_sec)
         try:
             rec_data = rec_proc.stdout.read(total_rec_bytes)
@@ -226,7 +218,7 @@ class CalibrationWorkerThread(QThread):
         count = len(rec_data) // 2
         samples = struct.unpack(f"<{count}h", rec_data[:count*2])
         
-        # 立ち上がりレイテンシをスキップするため、中盤 60% のサンプルで RMS を評価
+        # Evaluate steady samples (middle 60%) to skip latency transient
         start_idx = int(count * 0.2)
         end_idx = int(count * 0.8)
         steady_samples = samples[start_idx:end_idx] if end_idx > start_idx else samples
@@ -238,8 +230,8 @@ class CalibrationWorkerThread(QThread):
 
 def get_51ch_channel_volumes(sink_name="default"):
     """
-    現在の PipeWire / PulseAudio デフォルト Sink から各チャンネルの音量 (0.0 〜 1.5 等) を取得。
-    戻り値: [v_fl, v_fr, v_fc, v_lfe, v_rl, v_rr] (6要素の浮動小数点数リスト)
+    Retrieve current channel volumes (0.0 to 1.5+) from PipeWire / PulseAudio sink.
+    Returns: [v_fl, v_fr, v_fc, v_lfe, v_rl, v_rr] (6-element float list)
     """
     result = [1.0] * 6
     try:
@@ -266,8 +258,8 @@ def get_51ch_channel_volumes(sink_name="default"):
 
 def apply_51ch_channel_volumes(sink_name, volumes_list):
     """
-    PipeWire / PulseAudio の 5.1ch Sink に対してチャンネル別の音量を即時適用。
-    volumes_list: [v_fl, v_fr, v_fc, v_lfe, v_rl, v_rr] (各 0.0 〜 1.5 などの浮動小数点数)
+    Apply per-channel volumes to a 5.1ch PipeWire / PulseAudio sink.
+    volumes_list: [v_fl, v_fr, v_fc, v_lfe, v_rl, v_rr] (floats 0.0 to 1.5+)
     """
     import pulsectl
     with pulsectl.Pulse('guipipewire-51-calib') as pulse:
@@ -275,7 +267,7 @@ def apply_51ch_channel_volumes(sink_name, volumes_list):
             sink_name = pulse.server_info().default_sink_name
         sink = pulse.get_sink_by_name(sink_name)
         if not sink:
-            raise ValueError(f"Sink '{sink_name}' が見つかりません")
+            raise ValueError(f"Sink '{sink_name}' not found")
         
         vol_dict = {ch_id: volumes_list[i] for i, (ch_id, _) in enumerate(CHANNEL_NAMES) if i < len(volumes_list)}
         

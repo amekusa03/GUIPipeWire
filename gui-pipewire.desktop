@@ -1,9 +1,9 @@
 [Desktop Entry]
 Name=GUIPipeWire
-Comment=PipeWire GUI 設定ツール (Sample Rate, Quantum, Client Config Manager)
-Exec=/home/kusa/ドキュメント/Qt/GUIPipeWire/run.sh
+Comment=PipeWire Audio GUI Configuration Tool (Sample Rate, Quantum, 5.1ch Upmix, Mic AGC & DSP)
+Exec=/home/kusa/ドキュメント/python/GUIPipeWire/run.sh
 Icon=multimedia-audio-player
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Settings;Qt;
-Keywords=pipewire;audio;rate;quantum;systemctl;
+Keywords=pipewire;audio;rate;quantum;dsp;surround;upmix;agc;
